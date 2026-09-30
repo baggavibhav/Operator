@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import Settings
 from .security import assert_allowed
+from .web import web_open, web_search
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".csv", ".json", ".jsonl", ".py", ".js", ".ts",
@@ -228,4 +229,6 @@ TOOL_FUNCTIONS = {
     "move_files": move_files,
     "copy_files": copy_files,
     "rename_file": rename_file,
+    "web_search": web_search,
+    "web_open": web_open,
 }

@@ -42,6 +42,7 @@ class Settings:
     allowed_roots: tuple[Path, ...]
     max_read_chars: int = 12000
     max_steps: int = 10
+    web_enabled: bool = True
 
 
 def ensure_config() -> None:
@@ -54,6 +55,7 @@ def ensure_config() -> None:
         "allowed_roots": _default_roots(),
         "max_read_chars": 12000,
         "max_steps": 10,
+        "web_enabled": True,
     }
     CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -83,4 +85,5 @@ def load_settings(model_override: str | None = None) -> Settings:
         allowed_roots=roots,
         max_read_chars=int(data.get("max_read_chars", 12000)),
         max_steps=int(data.get("max_steps", 10)),
+        web_enabled=bool(data.get("web_enabled", True)),
     )

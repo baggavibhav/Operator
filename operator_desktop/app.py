@@ -10,39 +10,23 @@ from typing import Any
 
 from PySide6.QtCore import QPoint, QRect, QTimer, Qt, Signal, QObject, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (
-    QApplication,
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMenu,
-    QMessageBox,
-    QPushButton,
-    QSystemTrayIcon,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget
 
 from local_operator.config import APP_DIR, CONFIG_PATH, load_settings
+from .context import capture_desktop_context
 from .formatting import format_plan, format_result
 from .hotkeys import GlobalHotkey
 from .platforms import current_platform
 from .state import AgentState, presentation_for
 from .worker import OperatorWorker, TaskCallbacks
 
-
 LOG_PATH = APP_DIR / "desktop.log"
 
 
 def configure_logging() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")])
 
 
 def _make_tray_icon() -> QIcon:
@@ -62,6 +46,7 @@ class Bridge(QObject):
     plan = Signal(object)
     done = Signal(object)
     error = Signal(str)
+    cancelled = Signal(str)
     clarification = Signal(str)
     task = Signal(object)
     approval = Signal(str, object, object)
@@ -77,26 +62,21 @@ class ChatWindow(QDialog):
         self.setMinimumSize(440, 500)
         self.resize(500, 550)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
-
         layout = QVBoxLayout(self)
         header = QLabel("UNNAMED Operator")
         header.setFont(QFont("Segoe UI", 15, QFont.Weight.DemiBold))
         layout.addWidget(header)
-
         self.status = QLabel(f"Ready · {display_hotkey}")
         self.status.setStyleSheet("color: #777;")
         layout.addWidget(self.status)
-
         self.task_status = QLabel("No active task")
         self.task_status.setWordWrap(True)
         self.task_status.setStyleSheet("color: #8b8b94; font-size: 11px;")
         layout.addWidget(self.task_status)
-
         self.transcript = QTextEdit()
         self.transcript.setReadOnly(True)
         self.transcript.setPlaceholderText("Your local operator is ready.")
         layout.addWidget(self.transcript, 1)
-
         row = QHBoxLayout()
         self.input = QLineEdit()
         self.input.setPlaceholderText("Tell your computer what to do…")
@@ -142,7 +122,23 @@ class ChatWindow(QDialog):
         status = str(task.get("status", "unknown")).replace("_", " ")
         pending = task.get("pending_field")
         suffix = f" · waiting for {pending}" if pending else ""
-        self.task_status.setText(f"Task: {goal}\nState: {status}{suffix}")
+        lines = [f"Task: {goal}", f"State: {status}{suffix}"]
+        context = task.get("context")
+        desktop = context.get("desktop_context") if isinstance(context, dict) else None
+        if isinstance(desktop, dict):
+            app = str(desktop.get("active_app") or "").strip()
+            folder = str(desktop.get("current_folder") or "").strip()
+            selected = desktop.get("selected_files")
+            bits = []
+            if app:
+                bits.append(app)
+            if folder:
+                bits.append(Path(folder).name or folder)
+            if isinstance(selected, list) and selected:
+                bits.append(f"{len(selected)} selected")
+            if bits:
+                lines.append("Context: " + " · ".join(bits))
+        self.task_status.setText("\n".join(lines))
 
 
 class FloatingOrb(QWidget):
@@ -152,11 +148,7 @@ class FloatingOrb(QWidget):
     def __init__(self):
         super().__init__()
         self.setFixedSize(72, 72)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
-        )
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._state = AgentState.IDLE
@@ -185,41 +177,37 @@ class FloatingOrb(QWidget):
         self._phase = (self._phase + 0.14) % (math.pi * 2)
         self.update()
 
-    def paintEvent(self, event) -> None:  # noqa: N802
+    def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         pulse = 3 + (math.sin(self._phase) + 1) * 2
         center = self.rect().center()
         radius = 22
-
         if self._state in {AgentState.THINKING, AgentState.WORKING}:
             painter.setPen(QPen(QColor(90, 90, 100, 120), pulse))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(center, radius + 7, radius + 7)
-
         painter.setPen(QPen(QColor(235, 235, 240), 2))
         painter.setBrush(QColor(24, 24, 28))
         painter.drawEllipse(center, radius, radius)
-
-        symbol = presentation_for(self._state).symbol
         painter.setPen(QColor(245, 245, 248))
         painter.setFont(QFont("Segoe UI Symbol", 18, QFont.Weight.DemiBold))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, presentation_for(self._state).symbol)
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
+    def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = event.globalPosition().toPoint()
             self._window_start = self.pos()
             self._moved = False
 
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+    def mouseMoveEvent(self, event) -> None:
         if self._drag_start is not None and self._window_start is not None:
             delta = event.globalPosition().toPoint() - self._drag_start
             if delta.manhattanLength() > 5:
                 self._moved = True
             self.move(self._window_start + delta)
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+    def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             if not self._moved:
                 self.clicked.emit()
@@ -239,7 +227,6 @@ class DesktopOperator(QObject):
         self.chat = ChatWindow(self.platform.display_hotkey)
         self.orb = FloatingOrb()
         self.state = AgentState.IDLE
-
         callbacks = TaskCallbacks(
             on_plan=lambda plan: self.bridge.plan.emit(plan),
             on_state=lambda value: self.bridge.state.emit(value),
@@ -247,22 +234,22 @@ class DesktopOperator(QObject):
             on_clarification=lambda question: self.bridge.clarification.emit(question),
             on_task=lambda task: self.bridge.task.emit(task),
             on_error=lambda error: self.bridge.error.emit(error),
+            on_cancelled=lambda message: self.bridge.cancelled.emit(message),
             request_approval=self._request_approval_from_worker,
         )
-        self.worker = OperatorWorker(self.settings, callbacks)
-
+        self.worker = OperatorWorker(self.settings, callbacks, context_provider=capture_desktop_context)
         self.bridge.state.connect(self._on_state)
         self.bridge.plan.connect(self._on_plan)
         self.bridge.done.connect(self._on_done)
         self.bridge.clarification.connect(self._on_clarification)
         self.bridge.task.connect(self._on_task)
         self.bridge.error.connect(self._on_error)
+        self.bridge.cancelled.connect(self._on_cancelled)
         self.bridge.approval.connect(self._show_approval)
         self.bridge.toggle_requested.connect(self.toggle_chat)
         self.chat.submitted.connect(self.submit)
         self.orb.clicked.connect(self.toggle_chat)
         self.orb.context_requested.connect(self._show_orb_menu)
-
         self.tray = QSystemTrayIcon(_make_tray_icon(), self.app)
         self.tray.setToolTip("UNNAMED Operator")
         menu = QMenu()
@@ -278,7 +265,6 @@ class DesktopOperator(QObject):
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
-
         self.hotkey = GlobalHotkey(lambda: self.bridge.toggle_requested.emit())
 
     def start(self) -> None:
@@ -318,11 +304,12 @@ class DesktopOperator(QObject):
 
     def _on_done(self, results: list[dict[str, Any]]) -> None:
         self.set_state(AgentState.DONE)
-        if results:
-            self.chat.append_operator(format_result(results[-1]))
-        else:
-            self.chat.append_operator("Done. No actions were required.")
+        self.chat.append_operator(format_result(results[-1]) if results else "Done. No actions were required.")
         QTimer.singleShot(1800, lambda: self.set_state(AgentState.IDLE))
+
+    def _on_cancelled(self, message: str) -> None:
+        self.set_state(AgentState.IDLE)
+        self.chat.append_operator(message)
 
     def _on_error(self, error: str) -> None:
         self.set_state(AgentState.ERROR)
@@ -345,13 +332,9 @@ class DesktopOperator(QObject):
         event, answer = token
         self.set_state(AgentState.NEEDS_APPROVAL)
         details = "\n".join(f"{key}: {value}" for key, value in args.items())
-        response = QMessageBox.question(
-            self.chat,
-            "Approve action",
+        response = QMessageBox.question(self.chat, "Approve action",
             f"Operator wants to run a write action:\n\n{tool}\n\n{details}\n\nApprove?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         answer["approved"] = response == QMessageBox.StandardButton.Yes
         event.set()
 

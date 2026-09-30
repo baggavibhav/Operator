@@ -18,6 +18,7 @@ class TaskCallbacks:
     on_clarification: Callable[[str], None]
     on_task: Callable[[dict[str, Any]], None]
     on_error: Callable[[str], None]
+    on_cancelled: Callable[[str], None]
     request_approval: Callable[[str, dict[str, Any]], bool]
 
 
@@ -25,11 +26,11 @@ class OperatorWorker:
     """Runs the persistent orchestrator away from the GUI event loop."""
 
     def __init__(self, settings: Settings, callbacks: TaskCallbacks, backend: ModelBackend | None = None,
-                 store: TaskStore | None = None):
+                 store: TaskStore | None = None, context_provider: Callable[[], dict[str, Any]] | None = None):
         self.settings = settings
         self.callbacks = callbacks
         self.backend = backend or OllamaBackend(settings)
-        self.orchestrator = OperatorOrchestrator(settings, self.backend, store=store)
+        self.orchestrator = OperatorOrchestrator(settings, self.backend, store=store, context_provider=context_provider)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -49,29 +50,21 @@ class OperatorWorker:
             return False
         if not self._lock.acquire(blocking=False):
             return False
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(request.strip(),),
-            daemon=True,
-            name="operator-orchestrator",
-        )
+        self._thread = threading.Thread(target=self._run, args=(request.strip(),), daemon=True,
+                                        name="operator-orchestrator")
         self._thread.start()
         return True
 
     def _run(self, request: str) -> None:
-        hooks = OrchestratorHooks(
-            on_state=self.callbacks.on_state,
-            on_plan=self.callbacks.on_plan,
-            on_task=self.callbacks.on_task,
-        )
+        hooks = OrchestratorHooks(on_state=self.callbacks.on_state, on_plan=self.callbacks.on_plan,
+                                  on_task=self.callbacks.on_task)
         try:
-            outcome = self.orchestrator.handle_message(
-                request,
-                confirmer=self.callbacks.request_approval,
-                hooks=hooks,
-            )
+            outcome = self.orchestrator.handle_message(request, confirmer=self.callbacks.request_approval, hooks=hooks)
             if outcome.kind == "clarification":
                 self.callbacks.on_clarification(outcome.message)
+                return
+            if outcome.kind == "cancelled":
+                self.callbacks.on_cancelled(outcome.message or "Action cancelled.")
                 return
             self.callbacks.on_done(outcome.results or [])
         except Exception as exc:

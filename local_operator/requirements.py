@@ -27,8 +27,7 @@ def _looks_like_bulk_move_or_copy(goal: str) -> bool:
     text = " " + " ".join(goal.casefold().split()) + " "
     if not any(word in text for word in (" move ", " copy ")):
         return False
-    bulk = " all " in text or any(token in text for token in (" pdf files ", " pdfs ", " files "))
-    return bulk
+    return " all " in text or any(token in text for token in (" pdf files ", " pdfs ", " files "))
 
 
 def _goal_has_explicit_source(goal: str) -> bool:
@@ -37,25 +36,15 @@ def _goal_has_explicit_source(goal: str) -> bool:
 
 
 def infer_initial_requirements(task: TaskState) -> list[MissingInput]:
-    """Return deterministic missing inputs before asking the model to plan.
-
-    The orchestrator, not the LLM, owns obvious task-state requirements. V0.3
-    intentionally starts with a conservative filesystem rule: broad move/copy
-    operations need an explicit source location before planning can continue.
-    """
     if _looks_like_bulk_move_or_copy(task.goal):
+        if "explicit_sources" in task.context:
+            return []
         if "source_folder" not in task.context and not _goal_has_explicit_source(task.goal):
             return [MissingInput("source_folder", "Which folder should I move/copy the files from?")]
     return []
 
 
 def infer_field_from_question(question: str) -> str:
-    """Map model clarification text to a durable state slot.
-
-    Known semantic slots get stable names. Unknown questions are still persisted
-    using a generic field so the answer remains attached to the same task rather
-    than becoming a brand-new user request.
-    """
     text = " ".join(question.casefold().split())
     if any(token in text for token in (
         "which folder", "what folder", "where are", "where is", "located",
@@ -70,18 +59,12 @@ def infer_field_from_question(question: str) -> str:
 
 
 def bind_user_answer(task: TaskState, answer: str, settings: Settings) -> None:
-    """Attach a user's follow-up to the exact pending task field.
-
-    Path-like fields are grounded through the sandbox before entering task state.
-    Unknown clarification fields retain literal text without inventing semantics.
-    """
     field = task.pending_field
     if not field:
         raise ValueError("Task has no pending input field.")
     value = answer.strip()
     if not value:
         raise ValueError("Clarification answer cannot be empty.")
-
     if field in {"source_folder", "destination_folder", "path"}:
         try:
             resolved = assert_allowed(value, settings.allowed_roots)
@@ -97,25 +80,56 @@ def bind_user_answer(task: TaskState, answer: str, settings: Settings) -> None:
             clarifications = {}
             task.context["clarifications"] = clarifications
         clarifications[field] = value
-
     task.pending_field = None
     task.pending_question = None
 
 
+def _derive_desktop_context(task: TaskState, settings: Settings) -> None:
+    desktop = task.context.get("desktop_context")
+    if not isinstance(desktop, dict):
+        return
+    current = desktop.get("current_folder")
+    selected = desktop.get("selected_files")
+    goal = " ".join(task.goal.casefold().split())
+    if isinstance(current, str) and current and any(token in goal for token in ("this folder", "this directory", "from here")):
+        try:
+            task.context.setdefault("source_folder", str(assert_allowed(current, settings.allowed_roots)))
+        except (SecurityError, OSError, ValueError):
+            pass
+    deictic = any(token in goal for token in ("these files", "these pdfs", "selected files", "selected pdfs", "these documents"))
+    if deictic and isinstance(selected, list) and selected:
+        safe: list[str] = []
+        for value in selected:
+            if not isinstance(value, str):
+                continue
+            try:
+                path = assert_allowed(value, settings.allowed_roots)
+            except (SecurityError, OSError, ValueError):
+                continue
+            if path.is_file():
+                safe.append(str(path))
+        if safe:
+            task.context["explicit_sources"] = safe
+            task.context.setdefault("source_folder", str(Path(safe[0]).parent))
+    if "destination_folder" not in task.context and isinstance(current, str) and current:
+        match = re.search(r"\b(?:into|to)\s+(?:the\s+)?([A-Za-z0-9_. -]+?)(?:\s+folder)?[.!?]?$", task.goal, flags=re.IGNORECASE)
+        if match:
+            name = match.group(1).strip()
+            if name and name.casefold() not in {"it", "them", "there"}:
+                candidate = Path(current) / name
+                try:
+                    resolved = assert_allowed(candidate, settings.allowed_roots)
+                    if resolved.exists() and resolved.is_dir():
+                        task.context["destination_folder"] = str(resolved)
+                        task.context["destination_derived_from_desktop_context"] = True
+                except (SecurityError, OSError, ValueError):
+                    pass
+
 
 def derive_context(task: TaskState, settings: Settings) -> None:
-    """Derive narrow, deterministic facts from the goal once prerequisites exist.
-
-    V0.3 intentionally keeps this conservative. For example, after a source
-    folder is known, "a folder called PDFs inside OperatorTest" can be grounded
-    through the existing sandbox without asking the model to invent a path.
-    """
-    # Narrow file-type constraints belong to task state rather than to the
-    # planner. This prevents an underspecified model search from broadening a
-    # request such as "all PDF files" into "all files".
+    _derive_desktop_context(task, settings)
     if "file_extension" not in task.context and re.search(r"\bpdf(?:s|\s+files?)?\b", task.goal, flags=re.IGNORECASE):
         task.context["file_extension"] = ".pdf"
-
     if "destination_folder" in task.context:
         return
     match = re.search(
@@ -133,8 +147,8 @@ def derive_context(task: TaskState, settings: Settings) -> None:
     task.context["destination_folder"] = str(destination)
     task.context["destination_derived_from_goal"] = True
 
+
 def planner_context(task: TaskState) -> dict[str, Any]:
-    """Small, structured context passed to the planning component."""
     context = {
         "task_id": task.id,
         "goal": task.goal,

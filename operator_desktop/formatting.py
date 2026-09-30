@@ -29,7 +29,6 @@ def _human_size(value: int | float) -> str:
 def format_result(result: Any) -> str:
     if not isinstance(result, dict):
         return str(result)
-
     if "files" in result and isinstance(result["files"], list):
         files = result["files"]
         if not files:
@@ -42,15 +41,29 @@ def format_result(result: Any) -> str:
         if len(files) > 12:
             lines.append(f"…and {len(files) - 12} more")
         return "\n".join(lines)
-
+    if "results" in result and isinstance(result["results"], list):
+        items = result["results"]
+        if not items:
+            return "No web results found."
+        lines = []
+        for item in items[:8]:
+            title = item.get("title") or item.get("url") or "result"
+            url = item.get("url") or ""
+            lines.append(f"• {title}" + (f"\n  {url}" if url else ""))
+        return "\n".join(lines)
+    if "content" in result and "url" in result:
+        title = result.get("title") or result.get("url")
+        content = str(result.get("content") or "").strip()
+        return f"{title}\n\n{content[:3500]}" + ("\n…" if len(content) > 3500 else "")
     if "created" in result:
         return f"Created: {result['created']}"
     if "moved" in result:
-        return f"Moved {result.get('count', len(result['moved']))} file(s)."
+        count = result.get("count", len(result["moved"]))
+        return "No matching files found to move." if count == 0 else f"Moved {count} file(s)."
     if "copied" in result:
-        return f"Copied {result.get('count', len(result['copied']))} file(s)."
+        count = result.get("count", len(result["copied"]))
+        return "No matching files found to copy." if count == 0 else f"Copied {count} file(s)."
     if "to" in result and "from" in result:
         return f"Renamed/moved:\n{result['from']}\n→ {result['to']}"
-
     text = json.dumps(result, indent=2, default=str)
     return text[:5000] + ("\n…" if len(text) > 5000 else "")
