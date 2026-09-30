@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from local_operator.config import Settings
+from local_operator.model_backend import ModelBackend, OllamaBackend
+from local_operator.orchestrator import OperatorOrchestrator, OrchestratorHooks
+from local_operator.task_state import TaskStore
+
+
+@dataclass(frozen=True)
+class TaskCallbacks:
+    on_plan: Callable[[dict[str, Any]], None]
+    on_state: Callable[[str], None]
+    on_done: Callable[[list[dict[str, Any]]], None]
+    on_clarification: Callable[[str], None]
+    on_task: Callable[[dict[str, Any]], None]
+    on_error: Callable[[str], None]
+    request_approval: Callable[[str, dict[str, Any]], bool]
+
+
+class OperatorWorker:
+    """Runs the persistent orchestrator away from the GUI event loop."""
+
+    def __init__(self, settings: Settings, callbacks: TaskCallbacks, backend: ModelBackend | None = None,
+                 store: TaskStore | None = None):
+        self.settings = settings
+        self.callbacks = callbacks
+        self.backend = backend or OllamaBackend(settings)
+        self.orchestrator = OperatorOrchestrator(settings, self.backend, store=store)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def current_task(self) -> dict[str, Any] | None:
+        task = self.orchestrator.current_task()
+        return task.snapshot() if task else None
+
+    def close(self) -> None:
+        self.orchestrator.close()
+
+    def submit(self, request: str) -> bool:
+        if not request.strip():
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(request.strip(),),
+            daemon=True,
+            name="operator-orchestrator",
+        )
+        self._thread.start()
+        return True
+
+    def _run(self, request: str) -> None:
+        hooks = OrchestratorHooks(
+            on_state=self.callbacks.on_state,
+            on_plan=self.callbacks.on_plan,
+            on_task=self.callbacks.on_task,
+        )
+        try:
+            outcome = self.orchestrator.handle_message(
+                request,
+                confirmer=self.callbacks.request_approval,
+                hooks=hooks,
+            )
+            if outcome.kind == "clarification":
+                self.callbacks.on_clarification(outcome.message)
+                return
+            self.callbacks.on_done(outcome.results or [])
+        except Exception as exc:
+            self.callbacks.on_error(str(exc))
+        finally:
+            self._lock.release()

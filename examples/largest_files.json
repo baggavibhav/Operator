@@ -1,0 +1,14 @@
+{
+  "summary": "Show the five largest files in Downloads.",
+  "steps": [
+    {
+      "tool": "largest_files",
+      "args": {
+        "path": "~/Downloads",
+        "limit": 5,
+        "recursive": true
+      },
+      "reason": "This is a read-only size scan."
+    }
+  ]
+}

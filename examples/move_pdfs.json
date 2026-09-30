@@ -1,0 +1,31 @@
+{
+  "summary": "Find PDFs in Downloads and move them to a Test Operator folder.",
+  "steps": [
+    {
+      "tool": "search_files",
+      "args": {
+        "path": "~/Downloads",
+        "extension": ".pdf",
+        "recursive": false,
+        "limit": 20
+      },
+      "reason": "Find matching files before changing anything."
+    },
+    {
+      "tool": "create_folder",
+      "args": {
+        "path": "~/Downloads/Test Operator"
+      },
+      "reason": "Create the destination folder."
+    },
+    {
+      "tool": "move_files",
+      "args": {
+        "sources": "$steps.0.paths",
+        "destination_dir": "~/Downloads/Test Operator",
+        "overwrite": false
+      },
+      "reason": "Move only the files found in the read-only search."
+    }
+  ]
+}

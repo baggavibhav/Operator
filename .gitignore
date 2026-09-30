@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+
+# Local runtime state / logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
