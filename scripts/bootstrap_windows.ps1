@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-Write-Host "UNNAMED Operator V0.3.2 bootstrap"
+Write-Host "UNNAMED Operator V0.4 bootstrap"
 Write-Host "Development build: installs runtime dependencies into a local .venv only."
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
@@ -27,7 +27,7 @@ if ($InstalledHash -ne $CurrentHash) {
 }
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-    Write-Warning "Ollama was not found. Install/start Ollama for V0.3.2 model inference."
+    Write-Warning "Ollama was not found. Install/start Ollama for model-planned tasks. Grounded deterministic file tasks can run without model planning."
 } else {
     $ModelInstalled = ollama list 2>$null | Select-String -Pattern "^qwen2\.5:1\.5b\s"
     if (-not $ModelInstalled) {
@@ -38,5 +38,5 @@ if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
     }
 }
 
-Write-Host "Starting UNNAMED Operator V0.3.2..."
+Write-Host "Starting UNNAMED Operator V0.4..."
 & $Python .\desktop_main.py
