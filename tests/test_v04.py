@@ -7,9 +7,10 @@ from unittest.mock import patch
 
 from local_operator.audit import AuditLog
 from local_operator.config import Settings
+from local_operator.executor import ExecutionCancelled, execute_plan
 from local_operator.orchestrator import OperatorOrchestrator
 from local_operator.planner import PlannerError, prepare_plan
-from local_operator.requirements import derive_context, infer_initial_requirements
+from local_operator.requirements import compile_deterministic_plan, derive_context, infer_initial_requirements
 from local_operator.security import risk_for
 from local_operator.task_state import TaskState, TaskStatus, TaskStore
 from local_operator.web import WebAccessError, web_open, web_search
@@ -68,24 +69,16 @@ class V04Tests(unittest.TestCase):
             other = desktop / "two.pdf"
             selected.write_text("1")
             other.write_text("2")
-            candidate = {
-                "summary": "move selected PDFs",
-                "clarification": None,
-                "steps": [{
-                    "tool": "move_files",
-                    "args": {"sources": [str(other)], "destination_dir": str(target)},
-                    "reason": "move",
-                }],
-            }
             context = lambda: {
                 "platform": "Windows",
                 "active_app": "explorer.exe",
                 "current_folder": str(desktop),
                 "selected_files": [str(selected)],
             }
+            # Empty backend proves the grounded task does not need a planner call.
             orchestrator = OperatorOrchestrator(
                 self.settings(desktop),
-                FakeBackend([candidate]),
+                FakeBackend([]),
                 store=TaskStore(base / "tasks.db"),
                 audit=AuditLog(base / "audit.db"),
                 context_provider=context,
@@ -94,7 +87,27 @@ class V04Tests(unittest.TestCase):
             self.assertEqual(outcome.kind, "completed")
             self.assertTrue((target / "one.pdf").exists())
             self.assertTrue(other.exists())
+            self.assertEqual(outcome.task.context["plan_source"], "deterministic_orchestrator")
             self.assertEqual(outcome.task.plan["steps"][0]["args"]["sources"], [str(selected)])
+
+    def test_grounded_folder_search_is_compiled_without_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            source = base / "Desktop"
+            source.mkdir()
+            target = source / "OperatorTest"
+            target.mkdir()
+            (source / "one.pdf").write_text("1")
+            (source / "ignore.txt").write_text("x")
+            task = TaskState.create("Move all PDFs into OperatorTest")
+            task.context["source_folder"] = str(source)
+            task.context["destination_folder"] = str(target)
+            derive_context(task, self.settings(base))
+            plan = compile_deterministic_plan(task)
+            self.assertIsNotNone(plan)
+            self.assertEqual(plan["steps"][0]["tool"], "search_files")
+            self.assertEqual(plan["steps"][1]["tool"], "move_files")
+            self.assertEqual(plan["steps"][1]["args"]["sources"], "$steps.0.paths")
 
     def test_web_tools_are_read_only(self):
         self.assertEqual(risk_for("web_search"), "read")
@@ -166,6 +179,38 @@ class V04Tests(unittest.TestCase):
             self.assertEqual(outcome.kind, "cancelled")
             self.assertEqual(outcome.task.status, TaskStatus.CANCELLED)
             self.assertFalse((root / "nope").exists())
+
+    def test_task_store_can_cancel_waiting_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = TaskStore(Path(td) / "tasks.db")
+            task = store.create("Move PDFs")
+            task.status = TaskStatus.WAITING_FOR_INPUT
+            task.pending_field = "source_folder"
+            task.pending_question = "Where from?"
+            store.save(task)
+            cancelled = store.cancel_active()
+            self.assertIsNotNone(cancelled)
+            self.assertEqual(cancelled.status, TaskStatus.CANCELLED)
+            self.assertIsNone(cancelled.pending_question)
+            self.assertIsNone(store.latest_active())
+
+    def test_execute_plan_honors_cancel_before_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            plan = {
+                "summary": "read",
+                "clarification": None,
+                "steps": [{"tool": "list_files", "args": {"path": str(root)}, "reason": "test"}],
+            }
+            with self.assertRaises(ExecutionCancelled):
+                execute_plan(
+                    plan,
+                    self.settings(root),
+                    "list files",
+                    confirmer=lambda _t, _a: True,
+                    audit=AuditLog(root / "audit.db"),
+                    should_cancel=lambda: True,
+                )
 
     def test_desktop_context_snapshot_has_stable_shape(self):
         snapshot = capture_desktop_context()
