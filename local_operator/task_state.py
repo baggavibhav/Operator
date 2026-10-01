@@ -63,11 +63,7 @@ _ACTIVE_STATUSES = {
 
 
 class TaskStore:
-    """Durable task/checkpoint store used by the orchestrator.
-
-    SQLite is intentionally used instead of a server database for V0.3: the
-    assistant is single-user/local-first and the state must survive app restarts.
-    """
+    """Durable task/checkpoint store used by the local orchestrator."""
 
     def __init__(self, db_path: Path = TASK_DB_PATH):
         APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -193,6 +189,18 @@ class TaskStore:
                 (TaskStatus.WAITING_FOR_INPUT.value,),
             ).fetchone()
         return self._from_row(row) if row else None
+
+    def cancel_active(self, reason: str = "Cancelled by user.") -> TaskState | None:
+        task = self.latest_active()
+        if task is None:
+            return None
+        task.status = TaskStatus.CANCELLED
+        task.pending_field = None
+        task.pending_question = None
+        task.error = reason
+        task.context["cancelled_by_user"] = True
+        self.save(task)
+        return task
 
     def mark_inflight_interrupted(self) -> int:
         """Mark tasks that were mid-flight when the previous process stopped.
