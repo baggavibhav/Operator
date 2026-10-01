@@ -11,6 +11,7 @@ from .model_backend import ModelBackend
 from .planner import PlannerError, bind_known_context, prepare_plan
 from .requirements import (
     bind_user_answer,
+    compile_deterministic_plan,
     derive_context,
     infer_field_from_question,
     infer_initial_requirements,
@@ -57,6 +58,9 @@ class OperatorOrchestrator:
             return recent[0]
         return None
 
+    def cancel_current(self, reason: str = "Cancelled by user.") -> TaskState | None:
+        return self.store.cancel_active(reason)
+
     def close(self) -> None:
         self.store.close()
         self.audit.close()
@@ -99,18 +103,30 @@ class OperatorOrchestrator:
             self._save(task, hooks)
             hooks.on_state("waiting_for_input")
             return OrchestratorOutcome("clarification", task, need.question)
+
         hooks.on_state("thinking")
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
-        ok, detail = self.backend.available()
-        if not ok:
-            task.status = TaskStatus.FAILED
-            task.error = f"Local model runtime is unavailable at {self.settings.ollama_url}. {detail}"
-            self._save(task, hooks)
-            raise RuntimeError(task.error)
-        planned = self._plan_or_clarify(task, hooks)
-        if isinstance(planned, OrchestratorOutcome):
-            return planned
+
+        # Common grounded file workflows are compiled by the orchestrator, not
+        # delegated to a small language model. This reduces planner variance and
+        # makes the agent's durable state authoritative.
+        planned = compile_deterministic_plan(task)
+        if planned is not None:
+            task.context["plan_source"] = "deterministic_orchestrator"
+            planned = prepare_plan(planned, self.settings)
+        else:
+            ok, detail = self.backend.available()
+            if not ok:
+                task.status = TaskStatus.FAILED
+                task.error = f"Local model runtime is unavailable at {self.settings.ollama_url}. {detail}"
+                self._save(task, hooks)
+                raise RuntimeError(task.error)
+            planned = self._plan_or_clarify(task, hooks)
+            if isinstance(planned, OrchestratorOutcome):
+                return planned
+            task.context["plan_source"] = "model"
+
         task.plan = planned
         task.status = TaskStatus.READY
         task.current_step = 0
