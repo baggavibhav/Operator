@@ -125,9 +125,6 @@ class OperatorOrchestrator:
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
 
-        # The desktop agent can trust its own captured/grounded OS context for
-        # common file workflows. Non-desktop callers retain the model-planner
-        # path so the generic orchestrator remains backward compatible.
         grounded_desktop = isinstance(task.context.get("desktop_context"), dict)
         planned = compile_deterministic_plan(task) if grounded_desktop else None
         if planned is not None:
@@ -215,10 +212,8 @@ class OperatorOrchestrator:
             raise
 
         task.results = results
-        if should_cancel is not None and should_cancel():
-            outcome = self._cancelled(task, hooks)
-            self._save(task, hooks)
-            return outcome
+        # Once every planned tool has returned, stopping is too late to undo the
+        # completed side effects. Verify and report the real completed outcome.
         task.status = TaskStatus.VERIFYING
         self._save(task, hooks)
         check = verify_plan(task.plan, results)
@@ -316,8 +311,23 @@ class OperatorOrchestrator:
         context = planner_context(task)
         if control_note:
             context["orchestrator_control_note"] = control_note
-        return (f"USER_GOAL:\n{task.goal}\n\nORCHESTRATOR_CONTEXT_JSON_BEGIN\n"
-                f"{json.dumps(context, indent=2, default=str)}\nORCHESTRATOR_CONTEXT_JSON_END")
+        known = task.context
+        grounded_lines: list[str] = []
+        for field in ("source_folder", "destination_folder"):
+            value = known.get(field)
+            if isinstance(value, str) and value:
+                # This line is deliberately human-readable and not JSON escaped.
+                # It makes grounded Windows paths explicit to both small models
+                # and platform-neutral regression checks.
+                grounded_lines.append(f"{field.upper()}: {value}")
+        grounded = "\n".join(grounded_lines)
+        if grounded:
+            grounded = f"\nGROUNDED_PATHS_BEGIN\n{grounded}\nGROUNDED_PATHS_END\n"
+        return (
+            f"USER_GOAL:\n{task.goal}\n"
+            f"{grounded}\nORCHESTRATOR_CONTEXT_JSON_BEGIN\n"
+            f"{json.dumps(context, indent=2, default=str)}\nORCHESTRATOR_CONTEXT_JSON_END"
+        )
 
     def _save(self, task: TaskState, hooks: OrchestratorHooks) -> None:
         self.store.save(task)
