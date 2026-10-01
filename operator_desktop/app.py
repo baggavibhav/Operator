@@ -10,7 +10,20 @@ from typing import Any
 
 from PySide6.QtCore import QPoint, QRect, QTimer, Qt, Signal, QObject, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QSystemTrayIcon,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 
 from local_operator.config import APP_DIR, CONFIG_PATH, load_settings
 from .context import capture_desktop_context
@@ -21,12 +34,16 @@ from .state import AgentState, presentation_for
 from .worker import OperatorWorker, TaskCallbacks
 
 LOG_PATH = APP_DIR / "desktop.log"
+_ACTIVE_TASK_STATES = {"new", "waiting_for_input", "ready", "planning", "executing", "verifying"}
 
 
 def configure_logging() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")])
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8")],
+    )
 
 
 def _make_tray_icon() -> QIcon:
@@ -37,6 +54,10 @@ def _make_tray_icon() -> QIcon:
     painter.setBrush(QColor(25, 25, 28))
     painter.setPen(QPen(QColor(230, 230, 235), 3))
     painter.drawEllipse(7, 7, 50, 50)
+    painter.setBrush(QColor(240, 240, 245))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(23, 27, 5, 7)
+    painter.drawEllipse(36, 27, 5, 7)
     painter.end()
     return QIcon(pixmap)
 
@@ -55,6 +76,7 @@ class Bridge(QObject):
 
 class ChatWindow(QDialog):
     submitted = Signal(str)
+    stop_requested = Signal()
 
     def __init__(self, display_hotkey: str):
         super().__init__()
@@ -82,6 +104,11 @@ class ChatWindow(QDialog):
         self.input.setPlaceholderText("Tell your computer what to do…")
         self.input.returnPressed.connect(self._submit)
         row.addWidget(self.input, 1)
+        self.stop = QPushButton("Stop")
+        self.stop.setEnabled(False)
+        self.stop.setToolTip("Cancel the current task at the next safe boundary")
+        self.stop.clicked.connect(self.stop_requested.emit)
+        row.addWidget(self.stop)
         self.send = QPushButton("Send")
         self.send.clicked.connect(self._submit)
         row.addWidget(self.send)
@@ -111,15 +138,20 @@ class ChatWindow(QDialog):
         busy = state in {AgentState.THINKING, AgentState.WORKING, AgentState.NEEDS_APPROVAL}
         self.send.setEnabled(not busy)
         self.input.setEnabled(not busy)
+        if busy:
+            self.stop.setEnabled(True)
 
     def set_task(self, task: dict[str, Any] | None) -> None:
         if not task:
             self.task_status.setText("No active task")
+            self.stop.setEnabled(False)
             return
         goal = " ".join(str(task.get("goal", "")).split())
         if len(goal) > 90:
             goal = goal[:87] + "…"
         status = str(task.get("status", "unknown")).replace("_", " ")
+        raw_status = str(task.get("status", "unknown"))
+        self.stop.setEnabled(raw_status in _ACTIVE_TASK_STATES)
         pending = task.get("pending_field")
         suffix = f" · waiting for {pending}" if pending else ""
         lines = [f"Task: {goal}", f"State: {status}{suffix}"]
@@ -141,32 +173,40 @@ class ChatWindow(QDialog):
         self.task_status.setText("\n".join(lines))
 
 
-class FloatingOrb(QWidget):
+class Companion(QWidget):
+    """Procedural companion whose animation mirrors the real agent state."""
+
     clicked = Signal()
     context_requested = Signal(object)
 
     def __init__(self):
         super().__init__()
-        self.setFixedSize(72, 72)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setFixedSize(112, 100)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._state = AgentState.IDLE
         self._phase = 0.0
+        self._blink = 0.0
         self._drag_start: QPoint | None = None
         self._window_start: QPoint | None = None
         self._moved = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(50)
+        self._timer.start(40)
 
-    def show_near_corner(self) -> None:
+    def show_top_center(self) -> None:
         screen = QApplication.primaryScreen()
         if screen is None:
             self.show()
             return
         area: QRect = screen.availableGeometry()
-        self.move(area.right() - self.width() - 24, area.bottom() - self.height() - 24)
+        x = area.left() + (area.width() - self.width()) // 2
+        self.move(x, area.top() + 4)
         self.show()
 
     def set_state(self, state: AgentState) -> None:
@@ -174,25 +214,97 @@ class FloatingOrb(QWidget):
         self.update()
 
     def _tick(self) -> None:
-        self._phase = (self._phase + 0.14) % (math.pi * 2)
+        self._phase = (self._phase + 0.10) % (math.pi * 2)
+        # A short natural blink roughly every few seconds without random state.
+        cycle = self._phase % (math.pi * 2)
+        self._blink = max(0.0, 1.0 - abs(cycle - 5.65) / 0.16)
         self.update()
+
+    def _eye_offset(self) -> tuple[float, float]:
+        if self._state == AgentState.THINKING:
+            return 2.5 * math.sin(self._phase * 0.7), -2.0
+        if self._state == AgentState.WORKING:
+            return 2.0 * math.sin(self._phase * 1.4), 1.0
+        if self._state == AgentState.WAITING_FOR_INPUT:
+            return 0.0, -1.5
+        if self._state == AgentState.ERROR:
+            return -2.0, 1.5
+        return 0.0, 0.0
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pulse = 3 + (math.sin(self._phase) + 1) * 2
-        center = self.rect().center()
-        radius = 22
-        if self._state in {AgentState.THINKING, AgentState.WORKING}:
-            painter.setPen(QPen(QColor(90, 90, 100, 120), pulse))
+
+        cx = self.width() / 2
+        base_y = 49.0
+        breathe = 1.2 * math.sin(self._phase)
+        bounce = 0.0
+        if self._state == AgentState.DONE:
+            bounce = -4.0 * abs(math.sin(self._phase * 1.8))
+        elif self._state == AgentState.ERROR:
+            cx += 2.2 * math.sin(self._phase * 3.3)
+        y = base_y + breathe + bounce
+
+        rx = 29.0 + 0.8 * math.sin(self._phase)
+        ry = 27.0 - 0.6 * math.sin(self._phase)
+        if self._state == AgentState.THINKING:
+            rx += 1.6 * math.sin(self._phase * 1.7)
+            ry -= 1.2 * math.sin(self._phase * 1.7)
+        elif self._state == AgentState.LISTENING:
+            rx += 2.0
+            ry += 1.0
+
+        if self._state in {AgentState.THINKING, AgentState.WORKING, AgentState.NEEDS_APPROVAL}:
+            ring_alpha = 65 + int(35 * (math.sin(self._phase) + 1))
+            ring_color = QColor(160, 170, 195, ring_alpha)
+            if self._state == AgentState.NEEDS_APPROVAL:
+                ring_color = QColor(235, 190, 90, 150)
+            painter.setPen(QPen(ring_color, 3))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(center, radius + 7, radius + 7)
-        painter.setPen(QPen(QColor(235, 235, 240), 2))
-        painter.setBrush(QColor(24, 24, 28))
-        painter.drawEllipse(center, radius, radius)
-        painter.setPen(QColor(245, 245, 248))
-        painter.setFont(QFont("Segoe UI Symbol", 18, QFont.Weight.DemiBold))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, presentation_for(self._state).symbol)
+            painter.drawEllipse(int(cx - rx - 7), int(y - ry - 7), int((rx + 7) * 2), int((ry + 7) * 2))
+
+        body = QColor(29, 29, 34)
+        edge = QColor(225, 226, 233)
+        if self._state == AgentState.ERROR:
+            edge = QColor(230, 130, 130)
+        elif self._state == AgentState.DONE:
+            edge = QColor(155, 225, 175)
+        elif self._state == AgentState.NEEDS_APPROVAL:
+            edge = QColor(240, 205, 115)
+
+        painter.setPen(QPen(edge, 2.2))
+        painter.setBrush(body)
+        painter.drawEllipse(int(cx - rx), int(y - ry), int(rx * 2), int(ry * 2))
+
+        eye_dx, eye_dy = self._eye_offset()
+        eye_y = y - 4 + eye_dy
+        eye_gap = 10.5
+        eye_w = 5.5
+        eye_h = max(1.3, 8.0 * (1.0 - self._blink))
+        if self._state == AgentState.DONE:
+            eye_h = 4.0
+        elif self._state == AgentState.NEEDS_APPROVAL:
+            eye_h = 9.0
+            eye_w = 6.0
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(244, 244, 248))
+        painter.drawEllipse(int(cx - eye_gap - eye_w / 2 + eye_dx), int(eye_y - eye_h / 2), int(eye_w), int(eye_h))
+        painter.drawEllipse(int(cx + eye_gap - eye_w / 2 + eye_dx), int(eye_y - eye_h / 2), int(eye_w), int(eye_h))
+
+        # Tiny retractable hands: visible only when the state benefits from them.
+        if self._state in {AgentState.WORKING, AgentState.NEEDS_APPROVAL, AgentState.DONE}:
+            painter.setPen(QPen(edge, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            if self._state == AgentState.WORKING:
+                wave = 3.0 * math.sin(self._phase * 2.0)
+                painter.drawLine(int(cx - rx + 3), int(y + 8), int(cx - rx - 12), int(y + 15 + wave))
+                painter.drawLine(int(cx + rx - 3), int(y + 8), int(cx + rx + 12), int(y + 15 - wave))
+            elif self._state == AgentState.NEEDS_APPROVAL:
+                painter.drawLine(int(cx + rx - 4), int(y + 6), int(cx + rx + 10), int(y - 7))
+                painter.drawEllipse(int(cx + rx + 7), int(y - 12), 5, 5)
+            else:
+                painter.drawLine(int(cx - rx + 5), int(y + 7), int(cx - rx - 8), int(y + 1))
+                painter.drawLine(int(cx + rx - 5), int(y + 7), int(cx + rx + 8), int(y + 1))
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -225,7 +337,7 @@ class DesktopOperator(QObject):
         self.settings = load_settings()
         self.bridge = Bridge()
         self.chat = ChatWindow(self.platform.display_hotkey)
-        self.orb = FloatingOrb()
+        self.orb = Companion()
         self.state = AgentState.IDLE
         callbacks = TaskCallbacks(
             on_plan=lambda plan: self.bridge.plan.emit(plan),
@@ -248,14 +360,19 @@ class DesktopOperator(QObject):
         self.bridge.approval.connect(self._show_approval)
         self.bridge.toggle_requested.connect(self.toggle_chat)
         self.chat.submitted.connect(self.submit)
+        self.chat.stop_requested.connect(self.stop_current_task)
         self.orb.clicked.connect(self.toggle_chat)
         self.orb.context_requested.connect(self._show_orb_menu)
+
         self.tray = QSystemTrayIcon(_make_tray_icon(), self.app)
         self.tray.setToolTip("UNNAMED Operator")
         menu = QMenu()
         open_action = QAction("Open Operator", menu)
         open_action.triggered.connect(self.show_chat)
         menu.addAction(open_action)
+        self.stop_action = QAction("Stop current task", menu)
+        self.stop_action.triggered.connect(self.stop_current_task)
+        menu.addAction(self.stop_action)
         settings_action = QAction("Open Settings", menu)
         settings_action.triggered.connect(self.open_settings)
         menu.addAction(settings_action)
@@ -269,21 +386,36 @@ class DesktopOperator(QObject):
 
     def start(self) -> None:
         self.tray.show()
-        self.orb.show_near_corner()
+        self.orb.show_top_center()
         self.hotkey.start()
         snapshot = self.worker.current_task()
         self.chat.set_task(snapshot)
+        self._sync_stop_action(snapshot)
         if snapshot and snapshot.get("status") == "waiting_for_input" and snapshot.get("pending_question"):
             self.set_state(AgentState.WAITING_FOR_INPUT)
             self.chat.append_operator(f"Resuming pending task. {snapshot['pending_question']}")
         elif snapshot and snapshot.get("status") == "interrupted":
-            self.chat.append_operator("A previous task was interrupted. It was not resumed automatically because write actions may have partially completed.")
+            self.chat.append_operator(
+                "A previous task was interrupted. It was not resumed automatically because write actions may have partially completed."
+            )
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.chat.append_operator("System tray is not available on this desktop session.")
 
     def submit(self, request: str) -> None:
+        self.set_state(AgentState.LISTENING)
         if not self.worker.submit(request):
+            self.set_state(AgentState.IDLE)
             self.chat.append_operator("I'm already working on another task.")
+
+    def stop_current_task(self) -> None:
+        was_busy = self.worker.busy
+        snapshot = self.worker.stop_current()
+        if snapshot is None:
+            self.chat.append_operator("There is no active task to stop.")
+            return
+        if was_busy:
+            self.chat.append_operator("Stopping the task at the next safe boundary…")
+        self._sync_stop_action(snapshot)
 
     def _on_state(self, value: str) -> None:
         try:
@@ -297,6 +429,11 @@ class DesktopOperator(QObject):
 
     def _on_task(self, task: dict[str, Any]) -> None:
         self.chat.set_task(task)
+        self._sync_stop_action(task)
+
+    def _sync_stop_action(self, task: dict[str, Any] | None) -> None:
+        status = str(task.get("status", "")) if isinstance(task, dict) else ""
+        self.stop_action.setEnabled(status in _ACTIVE_TASK_STATES or self.worker.busy)
 
     def _on_clarification(self, question: str) -> None:
         self.set_state(AgentState.WAITING_FOR_INPUT)
@@ -305,14 +442,17 @@ class DesktopOperator(QObject):
     def _on_done(self, results: list[dict[str, Any]]) -> None:
         self.set_state(AgentState.DONE)
         self.chat.append_operator(format_result(results[-1]) if results else "Done. No actions were required.")
+        self._sync_stop_action(None)
         QTimer.singleShot(1800, lambda: self.set_state(AgentState.IDLE))
 
     def _on_cancelled(self, message: str) -> None:
         self.set_state(AgentState.IDLE)
+        self._sync_stop_action(None)
         self.chat.append_operator(message)
 
     def _on_error(self, error: str) -> None:
         self.set_state(AgentState.ERROR)
+        self._sync_stop_action(None)
         self.chat.append_operator(f"Error: {error}")
         QTimer.singleShot(2500, lambda: self.set_state(AgentState.IDLE))
 
@@ -332,9 +472,13 @@ class DesktopOperator(QObject):
         event, answer = token
         self.set_state(AgentState.NEEDS_APPROVAL)
         details = "\n".join(f"{key}: {value}" for key, value in args.items())
-        response = QMessageBox.question(self.chat, "Approve action",
+        response = QMessageBox.question(
+            self.chat,
+            "Approve action",
             f"Operator wants to run a write action:\n\n{tool}\n\n{details}\n\nApprove?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
         answer["approved"] = response == QMessageBox.StandardButton.Yes
         event.set()
 
@@ -345,12 +489,16 @@ class DesktopOperator(QObject):
     def _show_orb_menu(self, global_pos: QPoint) -> None:
         menu = QMenu(self.orb)
         open_action = menu.addAction("Open")
+        stop_action = menu.addAction("Stop current task")
+        stop_action.setEnabled(self.worker.busy or self.worker.current_task() is not None)
         settings_action = menu.addAction("Settings")
         menu.addSeparator()
         quit_action = menu.addAction("Quit")
         selected = menu.exec(global_pos)
         if selected == open_action:
             self.show_chat()
+        elif selected == stop_action:
+            self.stop_current_task()
         elif selected == settings_action:
             self.open_settings()
         elif selected == quit_action:
@@ -366,6 +514,12 @@ class DesktopOperator(QObject):
             self.show_chat()
 
     def show_chat(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = area.left() + (area.width() - self.chat.width()) // 2
+            y = area.top() + self.orb.height() + 10
+            self.chat.move(x, y)
         self.chat.show()
         self.chat.raise_()
         self.chat.activateWindow()
