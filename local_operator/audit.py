@@ -4,8 +4,9 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import AUDIT_DB_PATH, APP_DIR
 
@@ -18,7 +19,7 @@ class AuditLog:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -53,8 +54,20 @@ class AuditLog:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def start_run(self, request: str, model: str, plan: dict[str, Any] | None) -> int:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             cur = conn.execute(
                 "INSERT INTO runs(started_at, request, model, plan_json, status) VALUES (?, ?, ?, ?, ?)",
                 (time.time(), request, model, json.dumps(plan) if plan else None, "running"),
@@ -62,7 +75,7 @@ class AuditLog:
             return int(cur.lastrowid)
 
     def finish_run(self, run_id: int, status: str, error: str | None = None) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 "UPDATE runs SET finished_at=?, status=?, error=? WHERE id=?",
                 (time.time(), status, error, run_id),
@@ -71,7 +84,7 @@ class AuditLog:
     def action(self, run_id: int, step_index: int, tool: str, risk: str, args: dict[str, Any],
                approved: bool | None, result: dict[str, Any] | None, status: str,
                duration_ms: float, error: str | None = None) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """INSERT INTO actions(run_id, step_index, tool, risk, args_json, approved,
                    result_json, status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -84,8 +97,6 @@ class AuditLog:
             )
 
     def close(self) -> None:
-        # Connections are scoped to individual transactions, so no persistent
-        # SQLite handle needs closing here.
         return None
 
     def __enter__(self) -> "AuditLog":
@@ -95,7 +106,7 @@ class AuditLog:
         self.close()
 
     def recent_runs(self, limit: int = 10) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 "SELECT id, started_at, finished_at, request, model, status, error FROM runs ORDER BY id DESC LIMIT ?",
                 (max(1, min(int(limit), 100)),),
