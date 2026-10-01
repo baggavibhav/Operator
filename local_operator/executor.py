@@ -18,6 +18,10 @@ class ExecutionError(RuntimeError):
     pass
 
 
+class ExecutionCancelled(ExecutionError):
+    """Raised only at a safe boundary before another tool action begins."""
+
+
 def _pluck(value: Any, path: str | None) -> Any:
     if not path:
         return value
@@ -57,10 +61,16 @@ def _preview(tool: str, args: dict[str, Any]) -> str:
     return f"{tool}\n{compact}"
 
 
+def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise ExecutionCancelled("Task cancelled by user.")
+
+
 def execute_plan(plan: dict[str, Any], settings: Settings, request: str,
                  confirmer: Callable[[str, dict[str, Any]], bool], audit: AuditLog | None = None,
                  model_name: str | None = None,
-                 on_step: Callable[[int, str, dict[str, Any]], None] | None = None) -> list[dict[str, Any]]:
+                 on_step: Callable[[int, str, dict[str, Any]], None] | None = None,
+                 should_cancel: Callable[[], bool] | None = None) -> list[dict[str, Any]]:
     plan = prepare_plan(plan, settings)
     if plan.get("clarification"):
         raise ExecutionError(f"Clarification required: {plan['clarification']}")
@@ -69,15 +79,22 @@ def execute_plan(plan: dict[str, Any], settings: Settings, request: str,
     results: list[dict[str, Any]] = []
     try:
         for idx, step in enumerate(plan["steps"]):
+            # Cancellation is cooperative: never interrupt a tool mid-write. The
+            # stop request is honored before the next action begins.
+            _raise_if_cancelled(should_cancel)
             tool = step["tool"]
             args = resolve_refs(step["args"], results)
             risk = risk_for(tool)
             approved: bool | None = None
             if risk == "write":
+                _raise_if_cancelled(should_cancel)
                 approved = confirmer(tool, args)
                 if not approved:
                     audit.action(run_id, idx, tool, risk, args, False, None, "denied", 0.0)
                     raise ExecutionError(f"Write action denied by user: {tool}")
+                # A stop requested while the approval prompt was open prevents
+                # the write even if approval was granted a moment earlier.
+                _raise_if_cancelled(should_cancel)
             started = time.perf_counter()
             try:
                 result = TOOL_FUNCTIONS[tool](settings, **args)
@@ -92,6 +109,9 @@ def execute_plan(plan: dict[str, Any], settings: Settings, request: str,
                 on_step(idx, tool, result)
         audit.finish_run(run_id, "ok")
         return results
+    except ExecutionCancelled as exc:
+        audit.finish_run(run_id, "cancelled", str(exc))
+        raise
     except Exception as exc:
         audit.finish_run(run_id, "failed", str(exc))
         raise
