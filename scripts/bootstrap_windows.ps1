@@ -27,14 +27,14 @@ if ($InstalledHash -ne $CurrentHash) {
 }
 
 if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
-    Write-Warning "Ollama was not found. Install/start Ollama for model-planned tasks. Grounded deterministic file tasks can run without model planning."
+    Write-Warning "Ollama was not found. Install/start Ollama for model-planned and research-agent tasks. Grounded deterministic file tasks can run without model planning."
 } else {
-    $ModelInstalled = ollama list 2>$null | Select-String -Pattern "^qwen2\.5:1\.5b\s"
+    $ModelInstalled = ollama list 2>$null | Select-String -Pattern "^phi4-mini(?::latest)?\s"
     if (-not $ModelInstalled) {
-        Write-Host "Pulling local development model..."
-        ollama pull qwen2.5:1.5b
+        Write-Host "Pulling Phi-4 Mini local development model..."
+        ollama pull phi4-mini
     } else {
-        Write-Host "Local development model already installed."
+        Write-Host "Phi-4 Mini development model already installed."
     }
 }
 
