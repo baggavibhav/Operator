@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -19,6 +21,7 @@ from .requirements import (
 )
 from .security import risk_for
 from .task_state import TaskState, TaskStatus, TaskStore
+from .tools import TOOL_FUNCTIONS
 from .verifier import verify_plan
 
 
@@ -121,6 +124,18 @@ class OperatorOrchestrator:
             hooks.on_state("waiting_for_input")
             return OrchestratorOutcome("clarification", task, need.question)
 
+        # Explicit public-web research requests use a bounded act→observe→reason
+        # loop. This avoids forcing an open-ended research goal into one static
+        # plan and prevents needless questions such as "how should I summarize?".
+        if self._should_use_web_agent(task) and callable(getattr(self.backend, "agent_turn", None)):
+            ok, detail = self.backend.available()
+            if not ok:
+                task.status = TaskStatus.FAILED
+                task.error = f"Local model runtime is unavailable at {self.settings.ollama_url}. {detail}"
+                self._save(task, hooks)
+                raise RuntimeError(task.error)
+            return self._run_web_agent(task, hooks, should_cancel=should_cancel)
+
         hooks.on_state("thinking")
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
@@ -154,6 +169,155 @@ class OperatorOrchestrator:
         self._save(task, hooks)
         hooks.on_plan(planned)
         return self._execute(task, confirmer, hooks, should_cancel=should_cancel)
+
+    @staticmethod
+    def _should_use_web_agent(task: TaskState) -> bool:
+        text = " ".join(task.goal.casefold().split())
+        if re.search(r"https?://\S+", text):
+            return True
+        explicit_web = any(token in text for token in ("the web", " web ", "internet", "online"))
+        research_verb = any(token in text for token in ("search", "browse", "research", "look up", "lookup", "find"))
+        return explicit_web and research_verb
+
+    def _run_web_agent(self, task: TaskState, hooks: OrchestratorHooks,
+                       should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
+        if not self.settings.web_enabled:
+            raise RuntimeError("Web access is disabled in Operator settings.")
+
+        task.context["plan_source"] = "bounded_web_agent"
+        task.plan = {"summary": "Bounded read-only web research agent", "clarification": None, "steps": []}
+        task.results = []
+        task.current_step = 0
+        task.status = TaskStatus.EXECUTING
+        self._save(task, hooks)
+        hooks.on_plan(task.plan)
+
+        run_id = self.audit.start_run(task.goal, self.settings.model, {"mode": "bounded_web_agent"})
+        observations: list[dict[str, Any]] = []
+        seen_actions: set[str] = set()
+        max_turns = max(2, min(int(self.settings.max_steps), 8))
+
+        try:
+            for turn in range(max_turns):
+                if should_cancel is not None and should_cancel():
+                    self.audit.finish_run(run_id, "cancelled", "Task cancelled by user.")
+                    outcome = self._cancelled(task, hooks)
+                    self._save(task, hooks)
+                    return outcome
+
+                hooks.on_state("thinking")
+                task.status = TaskStatus.PLANNING
+                self._save(task, hooks)
+                decision = self.backend.agent_turn(task.goal, observations)
+                if not isinstance(decision, dict):
+                    raise RuntimeError("Agent reasoning turn did not return an object.")
+
+                kind = str(decision.get("type", "")).casefold().strip()
+                if kind == "final":
+                    answer = str(decision.get("answer") or "").strip()
+                    if not answer:
+                        raise RuntimeError("Agent produced an empty final answer.")
+                    raw_suggestions = decision.get("suggestions")
+                    suggestions = []
+                    if isinstance(raw_suggestions, list):
+                        for value in raw_suggestions:
+                            if isinstance(value, str) and value.strip():
+                                suggestions.append(value.strip())
+                            if len(suggestions) >= 3:
+                                break
+                    final_result = {
+                        "answer": answer,
+                        "suggestions": suggestions,
+                        "agent_turns": turn + 1,
+                        "source_count": sum(1 for item in observations if item.get("tool") == "web_open"),
+                    }
+                    task.results.append(final_result)
+                    task.context["web_agent_observations"] = len(observations)
+                    task.context["suggestions"] = suggestions
+                    task.status = TaskStatus.COMPLETED
+                    task.error = None
+                    self._save(task, hooks)
+                    hooks.on_state("done")
+                    self.audit.finish_run(run_id, "ok")
+                    return OrchestratorOutcome("completed", task, answer, task.results)
+
+                if kind != "tool":
+                    raise RuntimeError("Agent must choose a read-only web tool or finish with an answer.")
+                tool = str(decision.get("tool", "")).strip()
+                if tool not in {"web_search", "web_open"}:
+                    raise RuntimeError(f"Agent attempted unsupported tool: {tool or '(missing)'}")
+                args = decision.get("args")
+                if not isinstance(args, dict):
+                    raise RuntimeError("Agent tool arguments must be an object.")
+
+                # Validate a one-step plan through the same deterministic compiler
+                # used by the normal planner. It enforces argument shape and URL
+                # safety before a network request is attempted.
+                validated = prepare_plan(
+                    {
+                        "summary": str(decision.get("reason") or "Read public web information"),
+                        "clarification": None,
+                        "steps": [{"tool": tool, "args": args, "reason": str(decision.get("reason") or "")}],
+                    },
+                    self.settings,
+                )
+                clean_args = validated["steps"][0]["args"]
+
+                # For a model-selected open, require that the exact URL was
+                # actually observed previously. This prevents hallucinated URLs.
+                if tool == "web_open":
+                    target = str(clean_args.get("url") or "")
+                    observed_urls: set[str] = set()
+                    for item in observations:
+                        result = item.get("result")
+                        if not isinstance(result, dict):
+                            continue
+                        if isinstance(result.get("url"), str):
+                            observed_urls.add(result["url"])
+                        for candidate in result.get("results", []) if isinstance(result.get("results"), list) else []:
+                            if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
+                                observed_urls.add(candidate["url"])
+                        for candidate in result.get("links", []) if isinstance(result.get("links"), list) else []:
+                            if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
+                                observed_urls.add(candidate["url"])
+                    user_supplied_url = re.search(r"https?://\S+", task.goal)
+                    if target not in observed_urls and not (user_supplied_url and target.rstrip(".,)") == user_supplied_url.group(0).rstrip(".,)")):
+                        raise RuntimeError("Agent attempted to open a URL that was not present in prior observations.")
+
+                fingerprint = json.dumps({"tool": tool, "args": clean_args}, sort_keys=True, default=str)
+                if fingerprint in seen_actions:
+                    observations.append({"tool": "orchestrator", "result": {"warning": "Duplicate web action blocked. Use existing observations or choose a different action."}})
+                    continue
+                seen_actions.add(fingerprint)
+
+                hooks.on_state("working")
+                task.status = TaskStatus.EXECUTING
+                self._save(task, hooks)
+                started = time.perf_counter()
+                try:
+                    result = TOOL_FUNCTIONS[tool](self.settings, **clean_args)
+                except Exception as exc:
+                    duration = (time.perf_counter() - started) * 1000
+                    self.audit.action(run_id, turn, tool, "read", clean_args, None, None, "failed", duration, str(exc))
+                    observations.append({"tool": tool, "result": {"error": str(exc)}})
+                    continue
+
+                duration = (time.perf_counter() - started) * 1000
+                self.audit.action(run_id, turn, tool, "read", clean_args, None, result, "ok", duration)
+                observation = {"tool": tool, "result": result}
+                observations.append(observation)
+                task.results.append(result)
+                task.current_step = len(observations)
+                self._save(task, hooks)
+                hooks.on_step(turn, tool, result)
+
+            raise RuntimeError("Web agent reached its bounded turn limit before completing the goal.")
+        except Exception as exc:
+            task.status = TaskStatus.FAILED
+            task.error = str(exc)
+            self._save(task, hooks)
+            self.audit.finish_run(run_id, "failed", str(exc))
+            raise
 
     def _execute(self, task: TaskState, confirmer: Callable[[str, dict[str, Any]], bool],
                  hooks: OrchestratorHooks,
@@ -212,8 +376,6 @@ class OperatorOrchestrator:
             raise
 
         task.results = results
-        # Once every planned tool has returned, stopping is too late to undo the
-        # completed side effects. Verify and report the real completed outcome.
         task.status = TaskStatus.VERIFYING
         self._save(task, hooks)
         check = verify_plan(task.plan, results)
@@ -316,9 +478,6 @@ class OperatorOrchestrator:
         for field in ("source_folder", "destination_folder"):
             value = known.get(field)
             if isinstance(value, str) and value:
-                # This line is deliberately human-readable and not JSON escaped.
-                # It makes grounded Windows paths explicit to both small models
-                # and platform-neutral regression checks.
                 grounded_lines.append(f"{field.upper()}: {value}")
         grounded = "\n".join(grounded_lines)
         if grounded:
