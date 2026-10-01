@@ -5,10 +5,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import APP_DIR, TASK_DB_PATH
 
@@ -70,7 +71,7 @@ class TaskStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             row = conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
             if row is None:
@@ -102,6 +103,18 @@ class TaskStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def create(self, goal: str) -> TaskState:
         task = TaskState.create(goal)
         self.save(task)
@@ -110,7 +123,7 @@ class TaskStore:
     def save(self, task: TaskState) -> None:
         task.updated_at = time.time()
         task.revision += 1
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO tasks(
@@ -149,7 +162,7 @@ class TaskStore:
             )
 
     def get(self, task_id: str) -> TaskState | None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
@@ -163,7 +176,7 @@ class TaskStore:
     def latest_active(self) -> TaskState | None:
         placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
         values = tuple(status.value for status in _ACTIVE_STATUSES)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 f"""
                 SELECT id, goal, status, context_json, pending_field, pending_question,
@@ -178,7 +191,7 @@ class TaskStore:
         return self._from_row(row) if row else None
 
     def latest_waiting(self) -> TaskState | None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             row = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
@@ -211,7 +224,7 @@ class TaskStore:
             TaskStatus.VERIFYING.value,
         )
         now = time.time()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -228,7 +241,6 @@ class TaskStore:
             return int(cur.rowcount)
 
     def close(self) -> None:
-        # Connections are scoped to each transaction; retained for API symmetry.
         return None
 
     def __enter__(self) -> "TaskStore":
@@ -238,7 +250,7 @@ class TaskStore:
         self.close()
 
     def recent(self, limit: int = 20) -> list[TaskState]:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             rows = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
