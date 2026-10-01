@@ -125,7 +125,11 @@ class OperatorOrchestrator:
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
 
-        planned = compile_deterministic_plan(task)
+        # The desktop agent can trust its own captured/grounded OS context for
+        # common file workflows. Non-desktop callers retain the model-planner
+        # path so the generic orchestrator remains backward compatible.
+        grounded_desktop = isinstance(task.context.get("desktop_context"), dict)
+        planned = compile_deterministic_plan(task) if grounded_desktop else None
         if planned is not None:
             task.context["plan_source"] = "deterministic_orchestrator"
             planned = prepare_plan(planned, self.settings)
