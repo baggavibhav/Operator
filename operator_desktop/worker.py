@@ -33,6 +33,7 @@ class OperatorWorker:
         self.orchestrator = OperatorOrchestrator(settings, self.backend, store=store, context_provider=context_provider)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
 
     @property
     def busy(self) -> bool:
@@ -42,7 +43,21 @@ class OperatorWorker:
         task = self.orchestrator.current_task()
         return task.snapshot() if task else None
 
+    def stop_current(self) -> dict[str, Any] | None:
+        """Request cancellation without killing a tool in the middle of a write."""
+        if self.busy:
+            self._cancel_event.set()
+            return self.current_task()
+        task = self.orchestrator.cancel_current("Task cancelled by user.")
+        if task is not None:
+            snapshot = task.snapshot()
+            self.callbacks.on_task(snapshot)
+            self.callbacks.on_cancelled("Task cancelled by user.")
+            return snapshot
+        return None
+
     def close(self) -> None:
+        self._cancel_event.set()
         self.orchestrator.close()
 
     def submit(self, request: str) -> bool:
@@ -50,6 +65,7 @@ class OperatorWorker:
             return False
         if not self._lock.acquire(blocking=False):
             return False
+        self._cancel_event.clear()
         self._thread = threading.Thread(target=self._run, args=(request.strip(),), daemon=True,
                                         name="operator-orchestrator")
         self._thread.start()
@@ -59,15 +75,21 @@ class OperatorWorker:
         hooks = OrchestratorHooks(on_state=self.callbacks.on_state, on_plan=self.callbacks.on_plan,
                                   on_task=self.callbacks.on_task)
         try:
-            outcome = self.orchestrator.handle_message(request, confirmer=self.callbacks.request_approval, hooks=hooks)
+            outcome = self.orchestrator.handle_message(
+                request,
+                confirmer=self.callbacks.request_approval,
+                hooks=hooks,
+                should_cancel=self._cancel_event.is_set,
+            )
             if outcome.kind == "clarification":
                 self.callbacks.on_clarification(outcome.message)
                 return
             if outcome.kind == "cancelled":
-                self.callbacks.on_cancelled(outcome.message or "Action cancelled.")
+                self.callbacks.on_cancelled(outcome.message or "Task cancelled by user.")
                 return
             self.callbacks.on_done(outcome.results or [])
         except Exception as exc:
             self.callbacks.on_error(str(exc))
         finally:
+            self._cancel_event.clear()
             self._lock.release()
