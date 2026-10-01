@@ -25,6 +25,7 @@ _DESTINATION_PATTERN = re.compile(
     r"\b(?:into|to)\s+(?:the\s+)?([A-Za-z0-9_. -]+?)(?:\s+folder)?(?:[.!?]|$)",
     flags=re.IGNORECASE,
 )
+_CREATE_FOLDER_PATTERN = re.compile(r"\bcreate\s+(?:a\s+)?(?:folder|directory)\b", re.IGNORECASE)
 
 
 def _move_or_copy_action(goal: str) -> str | None:
@@ -61,13 +62,12 @@ def _destination_name(goal: str) -> str | None:
 def infer_initial_requirements(task: TaskState) -> list[MissingInput]:
     if not _looks_like_bulk_move_or_copy(task.goal):
         return []
-
-    if "explicit_sources" not in task.context:
-        if "source_folder" not in task.context and not _goal_has_explicit_source(task.goal):
-            return [MissingInput("source_folder", "Which folder should I move/copy the files from?")]
-
-    if "destination_folder" not in task.context:
-        return [MissingInput("destination_folder", "Which folder should I move/copy the files to?")]
+    if "explicit_sources" in task.context:
+        return []
+    if "source_folder" not in task.context and not _goal_has_explicit_source(task.goal):
+        return [MissingInput("source_folder", "Which folder should I move/copy the files from?")]
+    # Destination ambiguity stays with normal planning. The orchestrator only owns
+    # source clarification here so existing open-ended workflows remain possible.
     return []
 
 
@@ -198,12 +198,7 @@ def derive_context(task: TaskState, settings: Settings) -> None:
 
 
 def compile_deterministic_plan(task: TaskState) -> dict[str, Any] | None:
-    """Compile common grounded file operations without asking the LLM to invent tool steps.
-
-    The model still interprets open-ended tasks. When the orchestrator already owns
-    explicit files or a grounded source + extension + destination, execution should
-    be deterministic and independent of small-model planner variance.
-    """
+    """Compile common grounded file operations without asking the LLM to invent tool steps."""
     action = _move_or_copy_action(task.goal)
     if action is None:
         return None
@@ -212,37 +207,56 @@ def compile_deterministic_plan(task: TaskState) -> dict[str, Any] | None:
         return None
 
     tool = f"{action}_files"
+    destination_path = Path(destination)
+    create_requested = bool(_CREATE_FOLDER_PATTERN.search(task.goal)) and not destination_path.exists()
+
     explicit = task.context.get("explicit_sources")
     if isinstance(explicit, list) and explicit and all(isinstance(item, str) for item in explicit):
+        steps: list[dict[str, Any]] = []
+        if create_requested:
+            steps.append({
+                "tool": "create_folder",
+                "args": {"path": destination},
+                "reason": "Create the destination explicitly requested by the user.",
+            })
+        steps.append({
+            "tool": tool,
+            "args": {"sources": list(explicit), "destination_dir": destination},
+            "reason": "Use the user's selected files as authoritative sources.",
+        })
         return {
             "summary": f"{action.title()} the selected files to the grounded destination",
             "clarification": None,
-            "steps": [{
-                "tool": tool,
-                "args": {"sources": list(explicit), "destination_dir": destination},
-                "reason": "Use the user's selected files as authoritative sources.",
-            }],
+            "steps": steps,
         }
 
     source = task.context.get("source_folder")
     extension = task.context.get("file_extension")
     if not isinstance(source, str) or not source or not isinstance(extension, str) or not extension:
         return None
+
+    steps = []
+    if create_requested:
+        steps.append({
+            "tool": "create_folder",
+            "args": {"path": destination},
+            "reason": "Create the destination explicitly requested by the user.",
+        })
+    search_index = len(steps)
+    steps.append({
+        "tool": "search_files",
+        "args": {"path": source, "extension": extension, "recursive": False, "limit": 200},
+        "reason": "Discover matching files locally instead of asking the user for exact paths.",
+    })
+    steps.append({
+        "tool": tool,
+        "args": {"sources": f"$steps.{search_index}.paths", "destination_dir": destination},
+        "reason": f"{action.title()} only the files returned by the grounded search.",
+    })
     return {
         "summary": f"Find matching files in the grounded source and {action} them",
         "clarification": None,
-        "steps": [
-            {
-                "tool": "search_files",
-                "args": {"path": source, "extension": extension, "recursive": False, "limit": 200},
-                "reason": "Discover matching files locally instead of asking the user for exact paths.",
-            },
-            {
-                "tool": tool,
-                "args": {"sources": "$steps.0.paths", "destination_dir": destination},
-                "reason": f"{action.title()} only the files returned by the grounded search.",
-            },
-        ],
+        "steps": steps,
     }
 
 
