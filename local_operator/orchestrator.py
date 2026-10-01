@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from .audit import AuditLog
 from .config import Settings
-from .executor import ExecutionError, execute_plan
+from .executor import ExecutionCancelled, ExecutionError, execute_plan
 from .model_backend import ModelBackend
 from .planner import PlannerError, bind_known_context, prepare_plan
 from .requirements import (
@@ -65,8 +65,20 @@ class OperatorOrchestrator:
         self.store.close()
         self.audit.close()
 
+    @staticmethod
+    def _cancelled(task: TaskState, hooks: OrchestratorHooks,
+                   message: str = "Task cancelled by user.") -> OrchestratorOutcome:
+        task.status = TaskStatus.CANCELLED
+        task.pending_field = None
+        task.pending_question = None
+        task.error = message
+        task.context["cancelled_by_user"] = True
+        hooks.on_state("done")
+        return OrchestratorOutcome("cancelled", task, message, task.results)
+
     def handle_message(self, message: str, confirmer: Callable[[str, dict[str, Any]], bool],
-                       hooks: OrchestratorHooks | None = None) -> OrchestratorOutcome:
+                       hooks: OrchestratorHooks | None = None,
+                       should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
         hooks = hooks or OrchestratorHooks()
         text = message.strip()
         if not text:
@@ -90,10 +102,15 @@ class OperatorOrchestrator:
                     task.context["desktop_context_error"] = str(exc)
             derive_context(task, self.settings)
             self._emit_task(task, hooks)
-        return self._advance(task, confirmer, hooks)
+        if should_cancel is not None and should_cancel():
+            outcome = self._cancelled(task, hooks)
+            self._save(task, hooks)
+            return outcome
+        return self._advance(task, confirmer, hooks, should_cancel=should_cancel)
 
     def _advance(self, task: TaskState, confirmer: Callable[[str, dict[str, Any]], bool],
-                 hooks: OrchestratorHooks) -> OrchestratorOutcome:
+                 hooks: OrchestratorHooks,
+                 should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
         missing = infer_initial_requirements(task)
         if missing:
             need = missing[0]
@@ -108,9 +125,6 @@ class OperatorOrchestrator:
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
 
-        # Common grounded file workflows are compiled by the orchestrator, not
-        # delegated to a small language model. This reduces planner variance and
-        # makes the agent's durable state authoritative.
         planned = compile_deterministic_plan(task)
         if planned is not None:
             task.context["plan_source"] = "deterministic_orchestrator"
@@ -127,16 +141,22 @@ class OperatorOrchestrator:
                 return planned
             task.context["plan_source"] = "model"
 
+        if should_cancel is not None and should_cancel():
+            outcome = self._cancelled(task, hooks)
+            self._save(task, hooks)
+            return outcome
+
         task.plan = planned
         task.status = TaskStatus.READY
         task.current_step = 0
         task.results = []
         self._save(task, hooks)
         hooks.on_plan(planned)
-        return self._execute(task, confirmer, hooks)
+        return self._execute(task, confirmer, hooks, should_cancel=should_cancel)
 
     def _execute(self, task: TaskState, confirmer: Callable[[str, dict[str, Any]], bool],
-                 hooks: OrchestratorHooks) -> OrchestratorOutcome:
+                 hooks: OrchestratorHooks,
+                 should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
         assert task.plan is not None
         task.status = TaskStatus.EXECUTING
         self._save(task, hooks)
@@ -159,8 +179,20 @@ class OperatorOrchestrator:
             hooks.on_step(index, tool, result)
 
         try:
-            results = execute_plan(task.plan, settings=self.settings, request=task.goal, confirmer=confirmer,
-                                   audit=self.audit, model_name=self.settings.model, on_step=checkpoint)
+            results = execute_plan(
+                task.plan,
+                settings=self.settings,
+                request=task.goal,
+                confirmer=confirmer,
+                audit=self.audit,
+                model_name=self.settings.model,
+                on_step=checkpoint,
+                should_cancel=should_cancel,
+            )
+        except ExecutionCancelled:
+            outcome = self._cancelled(task, hooks)
+            self._save(task, hooks)
+            return outcome
         except Exception as exc:
             task.error = str(exc)
             if isinstance(exc, ExecutionError) and str(exc).startswith("Write action denied by user:"):
@@ -173,12 +205,16 @@ class OperatorOrchestrator:
                 task.context["last_execution_error"] = str(exc)
                 task.status = TaskStatus.READY
                 self._save(task, hooks)
-                return self._recover_read_only_failure(task, confirmer, hooks)
+                return self._recover_read_only_failure(task, confirmer, hooks, should_cancel=should_cancel)
             task.status = TaskStatus.FAILED
             self._save(task, hooks)
             raise
 
         task.results = results
+        if should_cancel is not None and should_cancel():
+            outcome = self._cancelled(task, hooks)
+            self._save(task, hooks)
+            return outcome
         task.status = TaskStatus.VERIFYING
         self._save(task, hooks)
         check = verify_plan(task.plan, results)
@@ -195,7 +231,12 @@ class OperatorOrchestrator:
         return OrchestratorOutcome("completed", task, "Task completed and verified.", results)
 
     def _recover_read_only_failure(self, task: TaskState, confirmer: Callable[[str, dict[str, Any]], bool],
-                                   hooks: OrchestratorHooks) -> OrchestratorOutcome:
+                                   hooks: OrchestratorHooks,
+                                   should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
+        if should_cancel is not None and should_cancel():
+            outcome = self._cancelled(task, hooks)
+            self._save(task, hooks)
+            return outcome
         hooks.on_state("thinking")
         task.status = TaskStatus.PLANNING
         task.results = []
@@ -210,7 +251,7 @@ class OperatorOrchestrator:
         task.status = TaskStatus.READY
         self._save(task, hooks)
         hooks.on_plan(planned)
-        return self._execute(task, confirmer, hooks)
+        return self._execute(task, confirmer, hooks, should_cancel=should_cancel)
 
     def _backend_propose(self, request: str) -> dict[str, Any]:
         proposer = getattr(self.backend, "propose", None)
