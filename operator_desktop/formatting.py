@@ -29,6 +29,17 @@ def _human_size(value: int | float) -> str:
 def format_result(result: Any) -> str:
     if not isinstance(result, dict):
         return str(result)
+    if "answer" in result:
+        answer = str(result.get("answer") or "").strip()
+        suggestions = result.get("suggestions")
+        lines = [answer or "Done."]
+        if isinstance(suggestions, list):
+            clean = [str(item).strip() for item in suggestions if str(item).strip()][:3]
+            if clean:
+                lines.append("")
+                lines.append("You can continue with:")
+                lines.extend(f"• {item}" for item in clean)
+        return "\n".join(lines)
     if "files" in result and isinstance(result["files"], list):
         files = result["files"]
         if not files:
