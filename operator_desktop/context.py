@@ -49,13 +49,21 @@ def _windows_foreground() -> tuple[int, str, str]:
 
 
 def _windows_explorer(hwnd: int) -> dict[str, Any]:
-    if not hwnd:
-        return {}
+    # By the time the user submits a request, Operator itself may be foreground.
+    # Prefer an exact foreground Explorer match, then fall back to an Explorer
+    # window that still has a selection. This preserves "these files" context
+    # after the chat window takes focus.
     script = r'''
 $ErrorActionPreference = 'SilentlyContinue'
 $targetHwnd = [int64]$env:OPERATOR_FOREGROUND_HWND
 $shell = New-Object -ComObject Shell.Application
-$window = @($shell.Windows()) | Where-Object { [int64]$_.HWND -eq $targetHwnd } | Select-Object -First 1
+$windows = @($shell.Windows())
+$window = @($windows) | Where-Object { [int64]$_.HWND -eq $targetHwnd } | Select-Object -First 1
+if ($null -eq $window) {
+    $window = @($windows) | Where-Object {
+        try { @($_.Document.SelectedItems()).Count -gt 0 } catch { $false }
+    } | Select-Object -First 1
+}
 if ($null -eq $window) { exit 0 }
 $current = $null
 $selected = @()
@@ -64,7 +72,7 @@ try { $selected = @($window.Document.SelectedItems() | ForEach-Object { $_.Path 
 @{ current_folder = $current; selected_files = $selected } | ConvertTo-Json -Compress -Depth 3
 '''
     env = os.environ.copy()
-    env["OPERATOR_FOREGROUND_HWND"] = str(hwnd)
+    env["OPERATOR_FOREGROUND_HWND"] = str(hwnd or 0)
     try:
         completed = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
