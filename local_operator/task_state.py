@@ -63,41 +63,44 @@ _ACTIVE_STATUSES = {
 
 
 class TaskStore:
-    """Durable task/checkpoint store used by the local orchestrator."""
+    """Durable SQLite checkpoints with short-lived database handles."""
 
     def __init__(self, db_path: Path = TASK_DB_PATH):
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        row = self._conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
-        if row is None:
-            self._conn.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
-        elif row[0] != "1":
-            raise RuntimeError(f"Unsupported task database schema version: {row[0]}")
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL,
-                context_json TEXT NOT NULL,
-                pending_field TEXT,
-                pending_question TEXT,
-                plan_json TEXT,
-                results_json TEXT NOT NULL,
-                current_step INTEGER NOT NULL,
-                error TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                revision INTEGER NOT NULL
+        with self._connect() as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            row = conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+            if row is None:
+                conn.execute("INSERT INTO metadata(key, value) VALUES ('schema_version', '1')")
+            elif row[0] != "1":
+                raise RuntimeError(f"Unsupported task database schema version: {row[0]}")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    context_json TEXT NOT NULL,
+                    pending_field TEXT,
+                    pending_question TEXT,
+                    plan_json TEXT,
+                    results_json TEXT NOT NULL,
+                    current_step INTEGER NOT NULL,
+                    error TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    revision INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
-        self._conn.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
 
     def create(self, goal: str) -> TaskState:
         task = TaskState.create(goal)
@@ -107,8 +110,8 @@ class TaskStore:
     def save(self, task: TaskState) -> None:
         task.updated_at = time.time()
         task.revision += 1
-        with self._lock:
-            self._conn.execute(
+        with self._lock, self._connect() as conn:
+            conn.execute(
                 """
                 INSERT INTO tasks(
                     id, goal, status, context_json, pending_field, pending_question,
@@ -144,11 +147,10 @@ class TaskStore:
                     int(task.revision),
                 ),
             )
-            self._conn.commit()
 
     def get(self, task_id: str) -> TaskState | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
                        plan_json, results_json, current_step, error, created_at, updated_at, revision
@@ -161,8 +163,8 @@ class TaskStore:
     def latest_active(self) -> TaskState | None:
         placeholders = ",".join("?" for _ in _ACTIVE_STATUSES)
         values = tuple(status.value for status in _ACTIVE_STATUSES)
-        with self._lock:
-            row = self._conn.execute(
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
                 f"""
                 SELECT id, goal, status, context_json, pending_field, pending_question,
                        plan_json, results_json, current_step, error, created_at, updated_at, revision
@@ -176,8 +178,8 @@ class TaskStore:
         return self._from_row(row) if row else None
 
     def latest_waiting(self) -> TaskState | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
                        plan_json, results_json, current_step, error, created_at, updated_at, revision
@@ -203,19 +205,14 @@ class TaskStore:
         return task
 
     def mark_inflight_interrupted(self) -> int:
-        """Mark tasks that were mid-flight when the previous process stopped.
-
-        Writes are never resumed automatically after a crash/restart. This avoids
-        duplicate side effects while preserving the checkpoint for inspection.
-        """
         inflight = (
             TaskStatus.PLANNING.value,
             TaskStatus.EXECUTING.value,
             TaskStatus.VERIFYING.value,
         )
         now = time.time()
-        with self._lock:
-            cur = self._conn.execute(
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
                 """
                 UPDATE tasks
                 SET status=?, error=COALESCE(error, ?), updated_at=?, revision=revision+1
@@ -228,15 +225,11 @@ class TaskStore:
                     *inflight,
                 ),
             )
-            self._conn.commit()
             return int(cur.rowcount)
 
     def close(self) -> None:
-        with self._lock:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
+        # Connections are scoped to each transaction; retained for API symmetry.
+        return None
 
     def __enter__(self) -> "TaskStore":
         return self
@@ -244,15 +237,9 @@ class TaskStore:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-
     def recent(self, limit: int = 20) -> list[TaskState]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
                 """
                 SELECT id, goal, status, context_json, pending_field, pending_question,
                        plan_json, results_json, current_step, error, created_at, updated_at, revision
