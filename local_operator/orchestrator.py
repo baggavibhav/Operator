@@ -15,6 +15,7 @@ from .requirements import (
     bind_user_answer,
     compile_deterministic_plan,
     derive_context,
+    goal_allows_write,
     infer_field_from_question,
     infer_initial_requirements,
     planner_context,
@@ -60,6 +61,9 @@ class OperatorOrchestrator:
         if recent and recent[0].status is TaskStatus.INTERRUPTED:
             return recent[0]
         return None
+
+    def recent_tasks(self, limit: int = 10) -> list[TaskState]:
+        return self.store.recent(limit)
 
     def cancel_current(self, reason: str = "Cancelled by user.") -> TaskState | None:
         return self.store.cancel_active(reason)
@@ -124,9 +128,6 @@ class OperatorOrchestrator:
             hooks.on_state("waiting_for_input")
             return OrchestratorOutcome("clarification", task, need.question)
 
-        # Explicit public-web research requests use a bounded act→observe→reason
-        # loop. This avoids forcing an open-ended research goal into one static
-        # plan and prevents needless questions such as "how should I summarize?".
         if self._should_use_web_agent(task) and callable(getattr(self.backend, "agent_turn", None)):
             ok, detail = self.backend.available()
             if not ok:
@@ -140,8 +141,9 @@ class OperatorOrchestrator:
         task.status = TaskStatus.PLANNING
         self._save(task, hooks)
 
-        grounded_desktop = isinstance(task.context.get("desktop_context"), dict)
-        planned = compile_deterministic_plan(task) if grounded_desktop else None
+        # Common local operations are deterministic even when desktop context is
+        # unavailable. The LLM should not invent plumbing for known tool patterns.
+        planned = compile_deterministic_plan(task)
         if planned is not None:
             task.context["plan_source"] = "deterministic_orchestrator"
             planned = prepare_plan(planned, self.settings)
@@ -157,6 +159,7 @@ class OperatorOrchestrator:
                 return planned
             task.context["plan_source"] = "model"
 
+        self._enforce_task_contract(task, planned)
         if should_cancel is not None and should_cancel():
             outcome = self._cancelled(task, hooks)
             self._save(task, hooks)
@@ -171,6 +174,16 @@ class OperatorOrchestrator:
         return self._execute(task, confirmer, hooks, should_cancel=should_cancel)
 
     @staticmethod
+    def _enforce_task_contract(task: TaskState, plan: dict[str, Any]) -> None:
+        if goal_allows_write(task.goal):
+            return
+        write_tools = [step.get("tool") for step in plan.get("steps", []) if isinstance(step, dict) and risk_for(str(step.get("tool"))) == "write"]
+        if write_tools:
+            raise PlannerError(
+                "Read-only request cannot gain write actions. Rejected planner tools: " + ", ".join(str(x) for x in write_tools)
+            )
+
+    @staticmethod
     def _should_use_web_agent(task: TaskState) -> bool:
         text = " ".join(task.goal.casefold().split())
         if re.search(r"https?://\S+", text):
@@ -179,13 +192,32 @@ class OperatorOrchestrator:
         research_verb = any(token in text for token in ("search", "browse", "research", "look up", "lookup", "find"))
         return explicit_web and research_verb
 
+    @staticmethod
+    def _web_completion_needs_open(goal: str) -> bool:
+        text = " ".join(goal.casefold().split())
+        return any(token in text for token in ("summarize", "summarise", "summary", "compare", "explain", "top result", "latest", "recent", "announcement"))
+
+    @staticmethod
+    def _web_sources(observations: list[dict[str, Any]]) -> list[dict[str, str]]:
+        sources: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in observations:
+            if item.get("tool") != "web_open" or not isinstance(item.get("result"), dict):
+                continue
+            result = item["result"]
+            url = str(result.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            sources.append({"title": str(result.get("title") or url), "url": url})
+        return sources
+
     def _run_web_agent(self, task: TaskState, hooks: OrchestratorHooks,
                        should_cancel: Callable[[], bool] | None = None) -> OrchestratorOutcome:
         if not self.settings.web_enabled:
             raise RuntimeError("Web access is disabled in Operator settings.")
-
         task.context["plan_source"] = "bounded_web_agent"
-        task.plan = {"summary": "Bounded read-only web research agent", "clarification": None, "steps": []}
+        task.plan = {"summary": "Bounded evidence-driven web research agent", "clarification": None, "steps": []}
         task.results = []
         task.current_step = 0
         task.status = TaskStatus.EXECUTING
@@ -195,7 +227,8 @@ class OperatorOrchestrator:
         run_id = self.audit.start_run(task.goal, self.settings.model, {"mode": "bounded_web_agent"})
         observations: list[dict[str, Any]] = []
         seen_actions: set[str] = set()
-        max_turns = max(2, min(int(self.settings.max_steps), 8))
+        max_turns = max(4, min(int(self.settings.max_steps), 10))
+        require_open = self._web_completion_needs_open(task.goal)
 
         try:
             for turn in range(max_turns):
@@ -211,14 +244,25 @@ class OperatorOrchestrator:
                 decision = self.backend.agent_turn(task.goal, observations)
                 if not isinstance(decision, dict):
                     raise RuntimeError("Agent reasoning turn did not return an object.")
-
                 kind = str(decision.get("type", "")).casefold().strip()
+
                 if kind == "final":
+                    opened = self._web_sources(observations)
+                    searches = sum(1 for item in observations if item.get("tool") == "web_search")
+                    if require_open and not opened:
+                        # Completion is an orchestrator decision. Give the model an
+                        # observation explaining the unmet contract and let it act.
+                        observations.append({"tool": "orchestrator", "result": {
+                            "completion_blocked": True,
+                            "reason": "This goal requires reading at least one result before a final answer.",
+                            "search_attempts": searches,
+                        }})
+                        continue
                     answer = str(decision.get("answer") or "").strip()
                     if not answer:
                         raise RuntimeError("Agent produced an empty final answer.")
                     raw_suggestions = decision.get("suggestions")
-                    suggestions = []
+                    suggestions: list[str] = []
                     if isinstance(raw_suggestions, list):
                         for value in raw_suggestions:
                             if isinstance(value, str) and value.strip():
@@ -228,8 +272,9 @@ class OperatorOrchestrator:
                     final_result = {
                         "answer": answer,
                         "suggestions": suggestions,
+                        "sources": opened,
                         "agent_turns": turn + 1,
-                        "source_count": sum(1 for item in observations if item.get("tool") == "web_open"),
+                        "source_count": len(opened),
                     }
                     task.results.append(final_result)
                     task.context["web_agent_observations"] = len(observations)
@@ -249,22 +294,13 @@ class OperatorOrchestrator:
                 args = decision.get("args")
                 if not isinstance(args, dict):
                     raise RuntimeError("Agent tool arguments must be an object.")
-
-                # Validate a one-step plan through the same deterministic compiler
-                # used by the normal planner. It enforces argument shape and URL
-                # safety before a network request is attempted.
-                validated = prepare_plan(
-                    {
-                        "summary": str(decision.get("reason") or "Read public web information"),
-                        "clarification": None,
-                        "steps": [{"tool": tool, "args": args, "reason": str(decision.get("reason") or "")}],
-                    },
-                    self.settings,
-                )
+                validated = prepare_plan({
+                    "summary": str(decision.get("reason") or "Read public web information"),
+                    "clarification": None,
+                    "steps": [{"tool": tool, "args": args, "reason": str(decision.get("reason") or "")}],
+                }, self.settings)
                 clean_args = validated["steps"][0]["args"]
 
-                # For a model-selected open, require that the exact URL was
-                # actually observed previously. This prevents hallucinated URLs.
                 if tool == "web_open":
                     target = str(clean_args.get("url") or "")
                     observed_urls: set[str] = set()
@@ -274,19 +310,19 @@ class OperatorOrchestrator:
                             continue
                         if isinstance(result.get("url"), str):
                             observed_urls.add(result["url"])
-                        for candidate in result.get("results", []) if isinstance(result.get("results"), list) else []:
-                            if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
-                                observed_urls.add(candidate["url"])
-                        for candidate in result.get("links", []) if isinstance(result.get("links"), list) else []:
-                            if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
-                                observed_urls.add(candidate["url"])
-                    user_supplied_url = re.search(r"https?://\S+", task.goal)
-                    if target not in observed_urls and not (user_supplied_url and target.rstrip(".,)") == user_supplied_url.group(0).rstrip(".,)")):
+                        for key in ("results", "links"):
+                            candidates = result.get(key)
+                            if isinstance(candidates, list):
+                                for candidate in candidates:
+                                    if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
+                                        observed_urls.add(candidate["url"])
+                    supplied = re.search(r"https?://\S+", task.goal)
+                    if target not in observed_urls and not (supplied and target.rstrip(".,)") == supplied.group(0).rstrip(".,)")):
                         raise RuntimeError("Agent attempted to open a URL that was not present in prior observations.")
 
                 fingerprint = json.dumps({"tool": tool, "args": clean_args}, sort_keys=True, default=str)
                 if fingerprint in seen_actions:
-                    observations.append({"tool": "orchestrator", "result": {"warning": "Duplicate web action blocked. Use existing observations or choose a different action."}})
+                    observations.append({"tool": "orchestrator", "result": {"warning": "Duplicate web action blocked; use existing evidence or choose a different action."}})
                     continue
                 seen_actions.add(fingerprint)
 
@@ -301,17 +337,15 @@ class OperatorOrchestrator:
                     self.audit.action(run_id, turn, tool, "read", clean_args, None, None, "failed", duration, str(exc))
                     observations.append({"tool": tool, "result": {"error": str(exc)}})
                     continue
-
                 duration = (time.perf_counter() - started) * 1000
                 self.audit.action(run_id, turn, tool, "read", clean_args, None, result, "ok", duration)
-                observation = {"tool": tool, "result": result}
-                observations.append(observation)
+                observations.append({"tool": tool, "result": result})
                 task.results.append(result)
                 task.current_step = len(observations)
                 self._save(task, hooks)
                 hooks.on_step(turn, tool, result)
 
-            raise RuntimeError("Web agent reached its bounded turn limit before completing the goal.")
+            raise RuntimeError("Web agent reached its bounded turn limit before satisfying the evidence/completion contract.")
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
@@ -344,16 +378,9 @@ class OperatorOrchestrator:
             hooks.on_step(index, tool, result)
 
         try:
-            results = execute_plan(
-                task.plan,
-                settings=self.settings,
-                request=task.goal,
-                confirmer=confirmer,
-                audit=self.audit,
-                model_name=self.settings.model,
-                on_step=checkpoint,
-                should_cancel=should_cancel,
-            )
+            results = execute_plan(task.plan, settings=self.settings, request=task.goal,
+                                   confirmer=confirmer, audit=self.audit, model_name=self.settings.model,
+                                   on_step=checkpoint, should_cancel=should_cancel)
         except ExecutionCancelled:
             outcome = self._cancelled(task, hooks)
             self._save(task, hooks)
@@ -403,11 +430,11 @@ class OperatorOrchestrator:
         task.results = []
         task.current_step = 0
         self._save(task, hooks)
-        note = ("A previous attempt failed before any write action occurred. Replan once using the recorded error in "
-                "orchestrator context. Do not repeat an invalid path or tool call.")
+        note = "Previous read-only attempt failed. Replan once without changing the user's side-effect contract."
         planned = self._plan_or_clarify(task, hooks, control_note=note)
         if isinstance(planned, OrchestratorOutcome):
             return planned
+        self._enforce_task_contract(task, planned)
         task.plan = planned
         task.status = TaskStatus.READY
         self._save(task, hooks)
@@ -447,8 +474,7 @@ class OperatorOrchestrator:
                         candidate["clarification"] = None
                     else:
                         last_error = f"Planner requested already-known field '{field}'."
-                        note = (f"{last_error} The orchestrator already has {field}={task.context.get(field)!r}. "
-                                "Return executable steps using durable task state.")
+                        note = f"{last_error} Use durable orchestrator context and return executable steps."
                         continue
                 else:
                     task.pending_field = field
@@ -459,11 +485,12 @@ class OperatorOrchestrator:
                     hooks.on_state("waiting_for_input")
                     return OrchestratorOutcome("clarification", task, question)
             try:
-                return prepare_plan(candidate, self.settings)
+                prepared = prepare_plan(candidate, self.settings)
+                self._enforce_task_contract(task, prepared)
+                return prepared
             except (PlannerError, PermissionError) as exc:
                 last_error = str(exc)
-                note = ("Deterministic plan compilation rejected the previous candidate: "
-                        f"{last_error}. Preserve all known orchestrator context and return one corrected executable plan.")
+                note = "Plan rejected by deterministic policy: " + last_error + ". Return one corrected minimal plan."
         task.status = TaskStatus.FAILED
         task.error = last_error or "Planner could not produce a valid executable plan."
         self._save(task, hooks)
@@ -471,6 +498,7 @@ class OperatorOrchestrator:
 
     def _planner_request(self, task: TaskState, control_note: str | None = None) -> str:
         context = planner_context(task)
+        context["side_effect_contract"] = "writes_allowed" if goal_allows_write(task.goal) else "read_only"
         if control_note:
             context["orchestrator_control_note"] = control_note
         known = task.context
@@ -482,11 +510,8 @@ class OperatorOrchestrator:
         grounded = "\n".join(grounded_lines)
         if grounded:
             grounded = f"\nGROUNDED_PATHS_BEGIN\n{grounded}\nGROUNDED_PATHS_END\n"
-        return (
-            f"USER_GOAL:\n{task.goal}\n"
-            f"{grounded}\nORCHESTRATOR_CONTEXT_JSON_BEGIN\n"
-            f"{json.dumps(context, indent=2, default=str)}\nORCHESTRATOR_CONTEXT_JSON_END"
-        )
+        return (f"USER_GOAL:\n{task.goal}\n{grounded}\nORCHESTRATOR_CONTEXT_JSON_BEGIN\n"
+                f"{json.dumps(context, indent=2, default=str)}\nORCHESTRATOR_CONTEXT_JSON_END")
 
     def _save(self, task: TaskState, hooks: OrchestratorHooks) -> None:
         self.store.save(task)
