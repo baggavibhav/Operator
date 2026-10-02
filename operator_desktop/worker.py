@@ -43,8 +43,10 @@ class OperatorWorker:
         task = self.orchestrator.current_task()
         return task.snapshot() if task else None
 
+    def recent_tasks(self, limit: int = 10) -> list[dict[str, Any]]:
+        return [task.snapshot() for task in self.orchestrator.recent_tasks(limit)]
+
     def stop_current(self) -> dict[str, Any] | None:
-        """Request cancellation without killing a tool in the middle of a write."""
         if self.busy:
             self._cancel_event.set()
             return self.current_task()
@@ -76,9 +78,7 @@ class OperatorWorker:
                                   on_task=self.callbacks.on_task)
         try:
             outcome = self.orchestrator.handle_message(
-                request,
-                confirmer=self.callbacks.request_approval,
-                hooks=hooks,
+                request, confirmer=self.callbacks.request_approval, hooks=hooks,
                 should_cancel=self._cancel_event.is_set,
             )
             if outcome.kind == "clarification":
