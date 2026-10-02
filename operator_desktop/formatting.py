@@ -31,13 +31,21 @@ def format_result(result: Any) -> str:
         return str(result)
     if "answer" in result:
         answer = str(result.get("answer") or "").strip()
-        suggestions = result.get("suggestions")
         lines = [answer or "Done."]
+        sources = result.get("sources")
+        if isinstance(sources, list) and sources:
+            lines.extend(["", "Sources:"])
+            for source in sources[:5]:
+                if not isinstance(source, dict):
+                    continue
+                title = str(source.get("title") or source.get("url") or "Source")
+                url = str(source.get("url") or "")
+                lines.append(f"• {title}" + (f" — {url}" if url else ""))
+        suggestions = result.get("suggestions")
         if isinstance(suggestions, list):
             clean = [str(item).strip() for item in suggestions if str(item).strip()][:3]
             if clean:
-                lines.append("")
-                lines.append("You can continue with:")
+                lines.extend(["", "You can continue with:"])
                 lines.extend(f"• {item}" for item in clean)
         return "\n".join(lines)
     if "files" in result and isinstance(result["files"], list):
@@ -66,6 +74,9 @@ def format_result(result: Any) -> str:
         title = result.get("title") or result.get("url")
         content = str(result.get("content") or "").strip()
         return f"{title}\n\n{content[:3500]}" + ("\n…" if len(content) > 3500 else "")
+    if "name" in result and "size_bytes" in result and "path" in result:
+        kind = "Folder" if result.get("is_dir") else "File"
+        return f"{kind}: {result['name']}\nSize: {_human_size(result['size_bytes'])}\nPath: {result['path']}"
     if "created" in result:
         return f"Created: {result['created']}"
     if "moved" in result:
