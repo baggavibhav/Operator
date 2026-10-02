@@ -7,7 +7,6 @@ from pathlib import Path
 from local_operator.audit import AuditLog
 from local_operator.config import Settings
 from local_operator.orchestrator import OperatorOrchestrator
-from local_operator.planner import PlannerError
 from local_operator.requirements import compile_deterministic_plan, derive_context
 from local_operator.task_state import TaskState, TaskStore
 
@@ -83,7 +82,7 @@ class V05Tests(unittest.TestCase):
             ]}
             orchestrator = OperatorOrchestrator(self.settings(root), FakeBackend(plans=[plan, plan]),
                                                 store=TaskStore(root / "tasks.db"), audit=AuditLog(root / "audit.db"))
-            with self.assertRaises(PlannerError):
+            with self.assertRaisesRegex(RuntimeError, "Read-only request cannot gain write actions"):
                 orchestrator.handle_message("Tell me what files are here", confirmer=lambda _t, _a: True)
             self.assertFalse((root / "oops").exists())
 
