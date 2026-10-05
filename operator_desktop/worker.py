@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -20,6 +21,26 @@ class TaskCallbacks:
     on_error: Callable[[str], None]
     on_cancelled: Callable[[str], None]
     request_approval: Callable[[str, dict[str, Any]], bool]
+
+
+_CASUAL_REPLIES = {
+    "hi": "Hi! What can I do?",
+    "hello": "Hello! What can I do?",
+    "hey": "Hey! What can I do?",
+    "good morning": "Good morning! What can I do?",
+    "good afternoon": "Good afternoon! What can I do?",
+    "good evening": "Good evening! What can I do?",
+    "thanks": "You're welcome.",
+    "thank you": "You're welcome.",
+    "thankyou": "You're welcome.",
+}
+
+
+def _casual_reply(text: str) -> str | None:
+    """Keep obvious social turns out of the action planner and tool layer."""
+    normalized = re.sub(r"[^a-z0-9 ]+", "", text.casefold()).strip()
+    normalized = " ".join(normalized.split())
+    return _CASUAL_REPLIES.get(normalized)
 
 
 class OperatorWorker:
@@ -74,9 +95,15 @@ class OperatorWorker:
         return True
 
     def _run(self, request: str) -> None:
-        hooks = OrchestratorHooks(on_state=self.callbacks.on_state, on_plan=self.callbacks.on_plan,
-                                  on_task=self.callbacks.on_task)
         try:
+            casual = _casual_reply(request)
+            if casual is not None:
+                self.callbacks.on_state("done")
+                self.callbacks.on_done([{"answer": casual, "kind": "conversation"}])
+                return
+
+            hooks = OrchestratorHooks(on_state=self.callbacks.on_state, on_plan=self.callbacks.on_plan,
+                                      on_task=self.callbacks.on_task)
             outcome = self.orchestrator.handle_message(
                 request, confirmer=self.callbacks.request_approval, hooks=hooks,
                 should_cancel=self._cancel_event.is_set,
