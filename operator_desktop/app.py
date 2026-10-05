@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import sys
 import threading
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPoint, QRect, QTimer, Qt, Signal, QObject, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QTimer, Qt, Signal, QObject, QUrl
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPen, QPixmap, QRadialGradient
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
 from local_operator.config import APP_DIR, CONFIG_PATH, load_settings
@@ -45,71 +46,166 @@ class Bridge(QObject):
 
 
 class Companion(QWidget):
+    """Small ambient character. State is communicated by motion, not chrome."""
+
     clicked = Signal(); context_requested = Signal(object)
 
     def __init__(self):
-        super().__init__(); self.setFixedSize(112, 100)
+        super().__init__()
+        self.setFixedSize(116, 104)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True); self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._state = AgentState.IDLE; self._phase = 0.0; self._blink = 0.0; self._drag_start = None; self._window_start = None; self._moved = False
-        self._timer = QTimer(self); self._timer.timeout.connect(self._tick); self._timer.start(40)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._state = AgentState.IDLE
+        self._phase = 0.0
+        self._hover = 0.0
+        self._hover_target = 0.0
+        self._press = 0.0
+        self._press_target = 0.0
+        self._blink = 0.0
+        self._blink_progress = -1.0
+        self._next_blink = random.uniform(2.6, 5.0)
+        self._drag_start = None
+        self._window_start = None
+        self._moved = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(40)
 
     def show_top_center(self) -> None:
         screen = QApplication.primaryScreen()
-        if screen is None: self.show(); return
-        area = screen.availableGeometry(); self.move(area.left() + (area.width() - self.width()) // 2, area.top() + 4); self.show()
+        if screen is None:
+            self.show(); return
+        area = screen.availableGeometry()
+        self.move(area.left() + (area.width() - self.width()) // 2, area.top() + 2)
+        self.show()
 
-    def set_state(self, state: AgentState) -> None: self._state = state; self.update()
+    def set_state(self, state: AgentState) -> None:
+        self._state = state; self.update()
+
+    def enterEvent(self, event) -> None:
+        self._hover_target = 1.0; super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover_target = 0.0; super().leaveEvent(event)
+
     def _tick(self) -> None:
-        self._phase = (self._phase + 0.10) % (math.pi * 2); cycle = self._phase % (math.pi * 2)
-        self._blink = max(0.0, 1.0 - abs(cycle - 5.65) / 0.16); self.update()
-    def _eye_offset(self):
-        if self._state == AgentState.THINKING: return 2.5 * math.sin(self._phase * .7), -2.0
-        if self._state == AgentState.WORKING: return 2.0 * math.sin(self._phase * 1.4), 1.0
-        if self._state == AgentState.WAITING_FOR_INPUT: return 0.0, -1.5
-        if self._state == AgentState.ERROR: return -2.0, 1.5
-        return 0.0, 0.0
+        dt = 0.04
+        self._phase = (self._phase + 0.065) % (math.pi * 200)
+        self._hover += (self._hover_target - self._hover) * 0.18
+        self._press += (self._press_target - self._press) * 0.28
+        self._next_blink -= dt
+        if self._blink_progress >= 0.0:
+            self._blink_progress += dt / 0.18
+            self._blink = math.sin(min(1.0, self._blink_progress) * math.pi)
+            if self._blink_progress >= 1.0:
+                self._blink_progress = -1.0; self._blink = 0.0; self._next_blink = random.uniform(2.8, 5.8)
+        elif self._next_blink <= 0.0:
+            self._blink_progress = 0.0
+        self.update()
+
+    def _eye_offset(self) -> tuple[float, float]:
+        if self._hover > 0.08:
+            local = self.mapFromGlobal(QCursor.pos())
+            vx = max(-1.0, min(1.0, (local.x() - self.width() / 2) / 50.0))
+            vy = max(-1.0, min(1.0, (local.y() - 48.0) / 42.0))
+            return 3.2 * vx * self._hover, 2.2 * vy * self._hover
+        if self._state == AgentState.THINKING:
+            return 3.0 * math.sin(self._phase * 0.55), -2.2 + 0.6 * math.cos(self._phase * 0.8)
+        if self._state == AgentState.WORKING:
+            return 2.2 * math.sin(self._phase * 1.15), 0.7
+        if self._state in {AgentState.WAITING_FOR_INPUT, AgentState.NEEDS_APPROVAL}:
+            return 0.0, -1.7
+        if self._state == AgentState.ERROR:
+            return -1.8, 1.2
+        return 1.35 * math.sin(self._phase * 0.23), 0.65 * math.sin(self._phase * 0.17)
+
+    def _edge_color(self) -> QColor:
+        if self._state == AgentState.ERROR: return QColor(231, 137, 137)
+        if self._state == AgentState.DONE: return QColor(163, 224, 181)
+        if self._state == AgentState.NEEDS_APPROVAL: return QColor(239, 203, 116)
+        if self._state in {AgentState.THINKING, AgentState.WORKING}: return QColor(203, 208, 224)
+        return QColor(226, 227, 233)
 
     def paintEvent(self, event) -> None:
-        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing); cx = self.width()/2; y = 49.0 + 1.2*math.sin(self._phase)
-        if self._state == AgentState.DONE: y -= 4.0*abs(math.sin(self._phase*1.8))
-        elif self._state == AgentState.ERROR: cx += 2.2*math.sin(self._phase*3.3)
-        rx=29.0+.8*math.sin(self._phase); ry=27.0-.6*math.sin(self._phase)
-        if self._state == AgentState.THINKING: rx += 1.6*math.sin(self._phase*1.7); ry -= 1.2*math.sin(self._phase*1.7)
-        elif self._state == AgentState.LISTENING: rx += 2; ry += 1
-        if self._state in {AgentState.THINKING,AgentState.WORKING,AgentState.NEEDS_APPROVAL}:
-            alpha=65+int(35*(math.sin(self._phase)+1)); ring=QColor(160,170,195,alpha)
-            if self._state == AgentState.NEEDS_APPROVAL: ring=QColor(235,190,90,150)
-            painter.setPen(QPen(ring,3)); painter.setBrush(Qt.BrushStyle.NoBrush); painter.drawEllipse(int(cx-rx-7),int(y-ry-7),int((rx+7)*2),int((ry+7)*2))
-        body=QColor(29,29,34); edge=QColor(225,226,233)
-        if self._state == AgentState.ERROR: edge=QColor(230,130,130)
-        elif self._state == AgentState.DONE: edge=QColor(155,225,175)
-        elif self._state == AgentState.NEEDS_APPROVAL: edge=QColor(240,205,115)
-        painter.setPen(QPen(edge,2.2)); painter.setBrush(body); painter.drawEllipse(int(cx-rx),int(y-ry),int(rx*2),int(ry*2))
-        dx,dy=self._eye_offset(); eye_y=y-4+dy; gap=10.5; ew=5.5; eh=max(1.3,8.0*(1.0-self._blink))
-        if self._state == AgentState.DONE: eh=4.0
-        elif self._state == AgentState.NEEDS_APPROVAL: eh=9.0; ew=6.0
-        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(244,244,248))
-        painter.drawEllipse(int(cx-gap-ew/2+dx),int(eye_y-eh/2),int(ew),int(eh)); painter.drawEllipse(int(cx+gap-ew/2+dx),int(eye_y-eh/2),int(ew),int(eh))
-        if self._state in {AgentState.WORKING,AgentState.NEEDS_APPROVAL,AgentState.DONE}:
-            painter.setPen(QPen(edge,3,Qt.PenStyle.SolidLine,Qt.PenCapStyle.RoundCap))
-            if self._state == AgentState.WORKING:
-                wave=3.0*math.sin(self._phase*2); painter.drawLine(int(cx-rx+3),int(y+8),int(cx-rx-12),int(y+15+wave)); painter.drawLine(int(cx+rx-3),int(y+8),int(cx+rx+12),int(y+15-wave))
-            elif self._state == AgentState.NEEDS_APPROVAL:
-                painter.drawLine(int(cx+rx-4),int(y+6),int(cx+rx+10),int(y-7)); painter.drawEllipse(int(cx+rx+7),int(y-12),5,5)
-            else:
-                painter.drawLine(int(cx-rx+5),int(y+7),int(cx-rx-8),int(y+1)); painter.drawLine(int(cx+rx-5),int(y+7),int(cx+rx+8),int(y+1))
+        painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx = self.width() / 2
+        breathe = math.sin(self._phase)
+        y = 48.0 + 1.25 * breathe
+        if self._state == AgentState.DONE:
+            y -= 3.0 * abs(math.sin(self._phase * 1.7))
+        elif self._state == AgentState.ERROR:
+            cx += 1.8 * math.sin(self._phase * 4.0)
 
-    def mousePressEvent(self,event):
-        if event.button()==Qt.MouseButton.LeftButton: self._drag_start=event.globalPosition().toPoint(); self._window_start=self.pos(); self._moved=False
-    def mouseMoveEvent(self,event):
+        scale = 1.0 + 0.035 * self._hover
+        rx = (28.5 + 0.65 * breathe + 1.8 * self._press) * scale
+        ry = (27.0 - 0.45 * breathe - 2.2 * self._press) * scale
+        if self._state == AgentState.THINKING:
+            rx += 1.1 * math.sin(self._phase * 1.35); ry -= 0.8 * math.sin(self._phase * 1.35)
+        elif self._state == AgentState.LISTENING:
+            rx += 1.4; ry += 0.7
+        edge = self._edge_color()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 34 + int(12 * self._hover)))
+        painter.drawEllipse(QRectF(cx - rx * 0.72, y + ry - 1.5, rx * 1.44, 7.0))
+
+        if self._state in {AgentState.THINKING, AgentState.WORKING, AgentState.NEEDS_APPROVAL}:
+            halo = QColor(edge); halo.setAlpha(82 if self._state != AgentState.NEEDS_APPROVAL else 125)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(halo, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            ring = QRectF(cx - rx - 6.5, y - ry - 6.5, (rx + 6.5) * 2, (ry + 6.5) * 2)
+            painter.drawArc(ring, int((-self._phase * 70.0) * 16), int(92 * 16))
+
+        gradient = QRadialGradient(QPointF(cx - 9.0, y - 11.0), max(rx, ry) * 1.55)
+        gradient.setColorAt(0.0, QColor(48 + int(5 * self._hover), 49 + int(5 * self._hover), 57 + int(6 * self._hover)))
+        gradient.setColorAt(0.55, QColor(30, 31, 37)); gradient.setColorAt(1.0, QColor(19, 20, 24))
+        painter.setBrush(gradient); painter.setPen(QPen(edge, 2.0 + 0.25 * self._hover))
+        painter.drawEllipse(QRectF(cx - rx, y - ry, rx * 2, ry * 2))
+
+        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(255, 255, 255, 14 + int(10 * self._hover)))
+        painter.drawEllipse(QRectF(cx - rx * 0.48, y - ry * 0.63, rx * 0.50, ry * 0.23))
+
+        dx, dy = self._eye_offset(); eye_y = y - 4.0 + dy; gap = 10.3; ew = 5.2
+        eh = max(1.15, 7.8 * (1.0 - self._blink))
+        if self._state == AgentState.DONE: eh = min(eh, 3.4)
+        elif self._state == AgentState.NEEDS_APPROVAL: eh = max(eh, 8.6); ew = 5.8
+        elif self._state == AgentState.LISTENING: eh = max(eh, 8.5)
+        painter.setPen(Qt.PenStyle.NoPen); painter.setBrush(QColor(246, 246, 249))
+        painter.drawEllipse(QRectF(cx - gap - ew / 2 + dx, eye_y - eh / 2, ew, eh))
+        painter.drawEllipse(QRectF(cx + gap - ew / 2 + dx, eye_y - eh / 2, ew, eh))
+
+        painter.setPen(QPen(edge, 2.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        if self._state == AgentState.WORKING:
+            wave = 2.5 * math.sin(self._phase * 1.8)
+            painter.drawLine(QPointF(cx - rx + 3, y + 8), QPointF(cx - rx - 9, y + 13 + wave))
+            painter.drawLine(QPointF(cx + rx - 3, y + 8), QPointF(cx + rx + 9, y + 13 - wave))
+        elif self._state == AgentState.NEEDS_APPROVAL:
+            painter.drawLine(QPointF(cx + rx - 4, y + 6), QPointF(cx + rx + 9, y - 7))
+            painter.setBrush(edge); painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(cx + rx + 6.5, y - 11.5, 4.5, 4.5))
+        elif self._state == AgentState.DONE:
+            lift = 2.0 + abs(math.sin(self._phase * 1.6))
+            painter.drawLine(QPointF(cx - rx + 5, y + 7), QPointF(cx - rx - 7, y + 2 - lift))
+            painter.drawLine(QPointF(cx + rx - 5, y + 7), QPointF(cx + rx + 7, y + 2 - lift))
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_target = 1.0; self._drag_start = event.globalPosition().toPoint(); self._window_start = self.pos(); self._moved = False
+
+    def mouseMoveEvent(self, event) -> None:
         if self._drag_start is not None and self._window_start is not None:
-            delta=event.globalPosition().toPoint()-self._drag_start; self._moved=self._moved or delta.manhattanLength()>5; self.move(self._window_start+delta)
-    def mouseReleaseEvent(self,event):
-        if event.button()==Qt.MouseButton.LeftButton:
+            delta = event.globalPosition().toPoint() - self._drag_start
+            self._moved = self._moved or delta.manhattanLength() > 5; self.move(self._window_start + delta)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._press_target = 0.0
+        if event.button() == Qt.MouseButton.LeftButton:
             if not self._moved: self.clicked.emit()
-            self._drag_start=None; self._window_start=None
-        elif event.button()==Qt.MouseButton.RightButton: self.context_requested.emit(event.globalPosition().toPoint())
+            self._drag_start = None; self._window_start = None
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.context_requested.emit(event.globalPosition().toPoint())
 
 
 class DesktopOperator(QObject):
@@ -137,7 +233,6 @@ class DesktopOperator(QObject):
     def submit(self,request):
         self._details_requested=False; self._latest_result=""; self._latest_error=""; self.set_state(AgentState.LISTENING)
         if self.worker.submit(request):
-            # Hand-off: after accepting a task the UI gets out of the user's way.
             QTimer.singleShot(220, self.chat.hide)
         else:
             self.set_state(AgentState.IDLE); self.chat.append_operator("I'm already working on another task.")
@@ -154,7 +249,6 @@ class DesktopOperator(QObject):
         self.set_state(state)
 
     def _on_plan(self,plan):
-        # Plans are diagnostic information. Keep them out of the normal UX.
         logging.getLogger(__name__).info("Agent plan: %s", format_plan(plan))
         if self._details_requested: self.chat.append_operator("Plan\n"+format_plan(plan))
 
@@ -167,7 +261,6 @@ class DesktopOperator(QObject):
 
     def _on_done(self,results):
         self.set_state(AgentState.DONE); self._latest_result=format_result(results[-1]) if results else "Done. No actions were required."; self.chat.append_operator(self._latest_result); self._sync_stop_action(None)
-        # Never steal focus when background work completes.
         self._notify("Operator finished", self._notification_preview(self._latest_result)); QTimer.singleShot(3500,lambda:self.set_state(AgentState.IDLE))
 
     def _on_cancelled(self,message):
