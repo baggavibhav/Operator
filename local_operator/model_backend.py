@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ Rules:
 - Work autonomously when the goal is actionable; do not ask style/presentation questions.
 - Search first when discovery is needed, then open a useful result before summarizing substantive claims.
 - Prefer primary/authoritative sources when available.
+- Once opened evidence is sufficient for the user's request, FINISH. Do not keep browsing merely because more turns are available.
 - For latest/recent/current requests, use CURRENT_LOCAL_DATETIME supplied by the orchestrator and search with relevant date/year terms when useful.
 - If a search is empty or weak, broaden/rephrase once rather than immediately concluding nothing exists.
 - Never invent facts or URLs.
@@ -43,6 +45,15 @@ Shapes:
 {"type":"tool","tool":"web_search","args":{"query":"...","limit":5},"reason":"..."}
 {"type":"tool","tool":"web_open","args":{"url":"...","max_chars":12000},"reason":"..."}
 {"type":"final","answer":"...","suggestions":["...","..."]}
+"""
+
+_FINAL_SYSTEM = """You are the synthesis stage of a local web research agent.
+Use ONLY the supplied web observations. Do not request another tool and do not invent facts.
+Answer the user's actual request directly and preserve requested formatting/length constraints.
+If the user asks for N bullet points, produce N useful bullet points when the evidence supports them.
+The desktop app will display source URLs separately, so do not fabricate citations.
+Return JSON only in exactly this shape:
+{"type":"final","answer":"...","suggestions":[]}
 """
 
 
@@ -151,6 +162,40 @@ def _valid_agent_decision(value: dict[str, Any]) -> bool:
     return False
 
 
+def _bounded_observations(observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bounded: list[dict[str, Any]] = []
+    for item in observations[-10:]:
+        tool = str(item.get("tool", ""))
+        result = item.get("result")
+        if isinstance(result, dict):
+            result = dict(result)
+            if isinstance(result.get("content"), str):
+                result["content"] = result["content"][:18_000]
+        bounded.append({"tool": tool, "result": result})
+    return bounded
+
+
+def _successful_open_count(observations: list[dict[str, Any]]) -> int:
+    count = 0
+    for item in observations:
+        if item.get("tool") != "web_open" or not isinstance(item.get("result"), dict):
+            continue
+        result = item["result"]
+        content = result.get("content")
+        if isinstance(content, str) and len(content.strip()) >= 120 and not result.get("error"):
+            count += 1
+    return count
+
+
+def _evidence_is_sufficient(goal: str, observations: list[dict[str, Any]]) -> bool:
+    opened = _successful_open_count(observations)
+    if opened <= 0:
+        return False
+    text = " ".join(goal.casefold().split())
+    comparison = bool(re.search(r"\b(compare|comparison|versus|vs\.?|difference|differences)\b", text))
+    return opened >= (2 if comparison else 1)
+
+
 @dataclass
 class OllamaBackend:
     settings: Settings
@@ -162,16 +207,32 @@ class OllamaBackend:
     def propose(self, request: str) -> dict[str, Any]:
         return propose_with_ollama(request, self.settings)
 
+    def _synthesize(self, goal: str, bounded: list[dict[str, Any]]) -> dict[str, Any]:
+        user = (
+            f"CURRENT_LOCAL_DATETIME:\n{datetime.now().astimezone().isoformat()}\n\n"
+            f"USER_GOAL:\n{goal}\n\n"
+            "WEB_OBSERVATIONS_JSON:\n" + json.dumps(bounded, ensure_ascii=False, default=str)
+        )
+        raw = _call_ollama_text(
+            self.settings,
+            [{"role": "system", "content": _FINAL_SYSTEM}, {"role": "user", "content": user}],
+            json_mode=True,
+        )
+        decision = _normalize_agent_decision(_parse_json_object(raw))
+        if not _valid_agent_decision(decision) or decision.get("type") != "final":
+            raise PlannerError("Web synthesis did not return a grounded final answer.")
+        return decision
+
     def agent_turn(self, goal: str, observations: list[dict[str, Any]]) -> dict[str, Any]:
-        bounded: list[dict[str, Any]] = []
-        for item in observations[-10:]:
-            tool = str(item.get("tool", ""))
-            result = item.get("result")
-            if isinstance(result, dict):
-                result = dict(result)
-                if isinstance(result.get("content"), str):
-                    result["content"] = result["content"][:18_000]
-            bounded.append({"tool": tool, "result": result})
+        bounded = _bounded_observations(observations)
+
+        # Once enough real page content has been read, stop asking a small local
+        # model whether it wants to browse more. Switch it into a final-only
+        # synthesis stage. This prevents useful research from burning the entire
+        # bounded turn budget on unnecessary extra searches/opens.
+        if _evidence_is_sufficient(goal, observations):
+            return self._synthesize(goal, bounded)
+
         user = (
             f"CURRENT_LOCAL_DATETIME:\n{datetime.now().astimezone().isoformat()}\n\n"
             f"USER_GOAL:\n{goal}\n\n"
