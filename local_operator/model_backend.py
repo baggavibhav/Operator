@@ -99,6 +99,58 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def _normalize_agent_decision(value: dict[str, Any]) -> dict[str, Any]:
+    """Accept harmless schema drift from small local models, never new capabilities."""
+    decision = dict(value)
+    kind = str(decision.get("type") or decision.get("kind") or decision.get("action") or "").casefold().strip()
+    tool = str(decision.get("tool") or "").casefold().strip()
+    args = decision.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    if tool in {"web_search", "web_open"}:
+        return {"type": "tool", "tool": tool, "args": args, "reason": str(decision.get("reason") or "")}
+
+    if kind in {"web_search", "search", "search_web"}:
+        query = args.get("query") or decision.get("query")
+        limit = args.get("limit", decision.get("limit", 5))
+        return {"type": "tool", "tool": "web_search", "args": {"query": query, "limit": limit}, "reason": str(decision.get("reason") or "")}
+
+    if kind in {"web_open", "open", "open_url", "read_url"}:
+        url = args.get("url") or decision.get("url")
+        max_chars = args.get("max_chars", decision.get("max_chars", 12000))
+        return {"type": "tool", "tool": "web_open", "args": {"url": url, "max_chars": max_chars}, "reason": str(decision.get("reason") or "")}
+
+    answer = decision.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        for key in ("final", "response", "summary"):
+            candidate = decision.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                answer = candidate
+                break
+    if kind in {"final", "answer", "finish", "finished", "done"} or isinstance(answer, str):
+        suggestions = decision.get("suggestions")
+        if not isinstance(suggestions, list):
+            suggestions = []
+        return {"type": "final", "answer": str(answer or "").strip(), "suggestions": suggestions}
+    return decision
+
+
+def _valid_agent_decision(value: dict[str, Any]) -> bool:
+    kind = str(value.get("type") or "").casefold().strip()
+    if kind == "final":
+        return isinstance(value.get("answer"), str) and bool(value["answer"].strip())
+    if kind != "tool":
+        return False
+    tool = str(value.get("tool") or "").strip()
+    args = value.get("args")
+    if tool == "web_search":
+        return isinstance(args, dict) and isinstance(args.get("query"), str) and bool(args["query"].strip())
+    if tool == "web_open":
+        return isinstance(args, dict) and isinstance(args.get("url"), str) and bool(args["url"].strip())
+    return False
+
+
 @dataclass
 class OllamaBackend:
     settings: Settings
@@ -125,9 +177,21 @@ class OllamaBackend:
             f"USER_GOAL:\n{goal}\n\n"
             "WEB_OBSERVATIONS_JSON:\n" + json.dumps(bounded, ensure_ascii=False, default=str)
         )
-        raw = _call_ollama_text(
+        messages = [{"role": "system", "content": _AGENT_SYSTEM}, {"role": "user", "content": user}]
+        raw = _call_ollama_text(self.settings, messages, json_mode=True)
+        decision = _normalize_agent_decision(_parse_json_object(raw))
+        if _valid_agent_decision(decision):
+            return decision
+
+        repair = (
+            "Your previous decision did not match the required schema. "
+            "Return exactly ONE valid JSON object using one of the three documented shapes. "
+            "Do not explain it and do not add a new capability.\n\n"
+            f"PREVIOUS_DECISION:\n{raw[:4000]}"
+        )
+        repaired_raw = _call_ollama_text(
             self.settings,
-            [{"role": "system", "content": _AGENT_SYSTEM}, {"role": "user", "content": user}],
+            messages + [{"role": "assistant", "content": raw}, {"role": "user", "content": repair}],
             json_mode=True,
         )
-        return _parse_json_object(raw)
+        return _normalize_agent_decision(_parse_json_object(repaired_raw))
