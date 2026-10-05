@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -20,25 +19,31 @@ from PySide6.QtWidgets import (
 from .state import AgentState, presentation_for
 
 _ACTIVE_TASK_STATES = {"new", "waiting_for_input", "ready", "planning", "executing", "verifying"}
+_BUSY_STATES = {AgentState.THINKING, AgentState.WORKING, AgentState.NEEDS_APPROVAL}
 
 
 class IslandWindow(QDialog):
-    """Compact frameless surface summoned by the companion.
+    """Adaptive companion surface.
 
-    The companion remains the persistent visual identity; this panel is only the
-    workspace it opens when the user wants to talk, inspect progress, or approve
-    work. Keep the public surface compatible with the former ChatWindow so the
-    agent runtime remains independent from presentation.
+    Idle is deliberately tiny: the character is the product, not a chat window.
+    The island grows only when there is work, conversation, or a result to show.
     """
 
     submitted = Signal(str)
     stop_requested = Signal()
+
+    COMPACT_SIZE = (460, 126)
+    ACTIVE_SIZE = (500, 220)
+    EXPANDED_SIZE = (520, 390)
 
     def __init__(self, display_hotkey: str):
         super().__init__()
         self._display_hotkey = display_hotkey
         self._drag_origin = None
         self._window_origin = None
+        self._has_conversation = False
+        self._pulse_on = True
+        self._state = AgentState.IDLE
 
         self.setWindowTitle("UNNAMED Operator")
         self.setWindowFlags(
@@ -47,122 +52,117 @@ class IslandWindow(QDialog):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMinimumSize(470, 310)
-        self.resize(560, 410)
+        self.setMinimumSize(*self.COMPACT_SIZE)
+        self.resize(*self.COMPACT_SIZE)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
+        # No top gutter: visually tucks the island into the companion instead of
+        # leaving the old detached-window gap.
+        root.setContentsMargins(8, 0, 8, 8)
 
         self.card = QFrame()
         self.card.setObjectName("islandCard")
         root.addWidget(self.card)
 
         layout = QVBoxLayout(self.card)
-        layout.setContentsMargins(20, 16, 20, 18)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(8)
 
-        top = QHBoxLayout()
-        top.setSpacing(8)
-        self.identity = QLabel("operator")
-        self.identity.setObjectName("identity")
-        self.identity.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
-        top.addWidget(self.identity)
-        top.addStretch(1)
-        self.status = QLabel(f"● Ready  ·  {display_hotkey}")
-        self.status.setObjectName("statePill")
-        top.addWidget(self.status)
-        self.collapse = QPushButton("—")
-        self.collapse.setObjectName("chromeButton")
-        self.collapse.setFixedSize(30, 26)
-        self.collapse.setToolTip("Collapse back to the companion")
-        self.collapse.clicked.connect(self.hide)
-        top.addWidget(self.collapse)
-        layout.addLayout(top)
+        # Status is intentionally text-only. The companion itself carries the
+        # personality and most state feedback.
+        self.status_row = QFrame()
+        status_layout = QHBoxLayout(self.status_row)
+        status_layout.setContentsMargins(2, 0, 2, 0)
+        status_layout.setSpacing(6)
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("statusDot")
+        self.status_dot.setFixedWidth(10)
+        self.status = QLabel("ready")
+        self.status.setObjectName("stateText")
+        status_layout.addWidget(self.status_dot)
+        status_layout.addWidget(self.status)
+        status_layout.addStretch(1)
+        self.stop = QPushButton("stop")
+        self.stop.setObjectName("stopButton")
+        self.stop.setToolTip("Stop at the next safe boundary")
+        self.stop.clicked.connect(self.stop_requested.emit)
+        self.stop.setVisible(False)
+        status_layout.addWidget(self.stop)
+        layout.addWidget(self.status_row)
 
-        self.task_status = QLabel("Ask me to do something on this computer.")
+        self.task_status = QLabel("")
         self.task_status.setObjectName("taskStatus")
         self.task_status.setWordWrap(True)
-        self.task_status.setMaximumHeight(54)
+        self.task_status.setVisible(False)
         layout.addWidget(self.task_status)
 
         self.transcript = QTextEdit()
         self.transcript.setObjectName("transcript")
         self.transcript.setReadOnly(True)
         self.transcript.setFrameShape(QFrame.Shape.NoFrame)
-        self.transcript.setPlaceholderText("Your local operator is ready.")
         self.transcript.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.transcript.setVisible(False)
         layout.addWidget(self.transcript, 1)
 
         composer = QFrame()
         composer.setObjectName("composer")
         composer_row = QHBoxLayout(composer)
-        composer_row.setContentsMargins(12, 8, 8, 8)
-        composer_row.setSpacing(8)
+        composer_row.setContentsMargins(13, 7, 7, 7)
+        composer_row.setSpacing(7)
 
         self.input = QLineEdit()
         self.input.setObjectName("promptInput")
-        self.input.setPlaceholderText("What should I do?")
+        self.input.setPlaceholderText("What can I do?")
         self.input.setFrame(False)
         self.input.returnPressed.connect(self._submit)
         composer_row.addWidget(self.input, 1)
 
-        self.stop = QPushButton("■")
-        self.stop.setObjectName("stopButton")
-        self.stop.setFixedSize(34, 34)
-        self.stop.setEnabled(False)
-        self.stop.setVisible(False)
-        self.stop.setToolTip("Stop at the next safe boundary")
-        self.stop.clicked.connect(self.stop_requested.emit)
-        composer_row.addWidget(self.stop)
-
         self.send = QPushButton("↑")
         self.send.setObjectName("sendButton")
-        self.send.setFixedSize(34, 34)
+        self.send.setFixedSize(32, 32)
         self.send.setToolTip("Send")
         self.send.clicked.connect(self._submit)
         composer_row.addWidget(self.send)
         layout.addWidget(composer)
 
-        self.hint = QLabel("Enter to send  ·  click the companion to collapse")
-        self.hint.setObjectName("hint")
-        layout.addWidget(self.hint)
-
         self.setStyleSheet(
             """
             QFrame#islandCard {
                 background: #15161a;
-                border: 1px solid #34363d;
-                border-radius: 24px;
+                border: 1px solid #303239;
+                border-radius: 22px;
             }
-            QLabel#identity {
-                color: #a9abb5;
-                letter-spacing: 1px;
-                padding-left: 2px;
+            QFrame#status_row { background: transparent; border: none; }
+            QLabel#statusDot {
+                color: #858995;
+                background: transparent;
+                border: none;
+                font-size: 8px;
             }
-            QLabel#statePill {
-                color: #c9cbd3;
-                background: #202127;
-                border: 1px solid #34363d;
-                border-radius: 11px;
-                padding: 4px 9px;
-                font-size: 11px;
+            QLabel#stateText {
+                color: #8c909b;
+                background: transparent;
+                border: none;
+                font-size: 10px;
             }
             QLabel#taskStatus {
-                color: #f1f1f4;
+                color: #e9eaf0;
+                background: transparent;
+                border: none;
                 font-size: 12px;
-                padding: 2px 2px 4px 2px;
+                padding: 1px 2px 3px 2px;
             }
             QTextEdit#transcript {
                 color: #ececf1;
                 background: transparent;
                 border: none;
                 selection-background-color: #3d465c;
-                font-size: 13px;
-                padding: 2px;
+                font-size: 12px;
+                padding: 0px 2px;
             }
             QFrame#composer {
                 background: #202127;
-                border: 1px solid #373941;
+                border: 1px solid #34363e;
                 border-radius: 18px;
             }
             QLineEdit#promptInput {
@@ -170,46 +170,42 @@ class IslandWindow(QDialog):
                 background: transparent;
                 border: none;
                 font-size: 13px;
-                padding: 4px 2px;
+                padding: 3px 1px;
             }
             QLineEdit#promptInput:disabled { color: #777983; }
             QPushButton#sendButton {
                 color: #111216;
                 background: #f0f1f4;
                 border: none;
-                border-radius: 17px;
-                font-size: 18px;
+                border-radius: 16px;
+                font-size: 17px;
                 font-weight: 700;
             }
             QPushButton#sendButton:hover { background: #ffffff; }
-            QPushButton#sendButton:disabled { background: #555861; color: #a0a2aa; }
+            QPushButton#sendButton:disabled { background: #4b4e56; color: #90939c; }
             QPushButton#stopButton {
-                color: #ffd6d6;
-                background: #4a2528;
-                border: 1px solid #744044;
-                border-radius: 17px;
-                font-size: 11px;
-            }
-            QPushButton#stopButton:hover { background: #5b2d31; }
-            QPushButton#chromeButton {
-                color: #9a9ca5;
+                color: #b7bac4;
                 background: transparent;
                 border: none;
-                border-radius: 10px;
-                font-size: 15px;
-            }
-            QPushButton#chromeButton:hover { background: #25262c; color: #ffffff; }
-            QLabel#hint {
-                color: #686b75;
+                padding: 2px 4px;
                 font-size: 10px;
-                padding-left: 3px;
             }
+            QPushButton#stopButton:hover { color: #ffffff; }
             """
         )
 
         self._fade = QPropertyAnimation(self, b"windowOpacity", self)
-        self._fade.setDuration(150)
+        self._fade.setDuration(130)
         self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        # A restrained pulse makes the surface feel responsive without turning
+        # it into an animated dashboard. The character remains the focal point.
+        self._pulse = QTimer(self)
+        self._pulse.setInterval(520)
+        self._pulse.timeout.connect(self._pulse_status)
+        self._pulse.start()
+
+        self._apply_mode("compact")
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -218,9 +214,10 @@ class IslandWindow(QDialog):
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)
         self._fade.start()
+        QTimer.singleShot(80, self.input.setFocus)
 
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 58:
+        if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 44:
             self._drag_origin = event.globalPosition().toPoint()
             self._window_origin = self.pos()
         super().mousePressEvent(event)
@@ -235,6 +232,33 @@ class IslandWindow(QDialog):
         self._window_origin = None
         super().mouseReleaseEvent(event)
 
+    def _pulse_status(self) -> None:
+        self._pulse_on = not self._pulse_on
+        if self._state in _BUSY_STATES:
+            self.status_dot.setText("●" if self._pulse_on else "·")
+        else:
+            self.status_dot.setText("●")
+
+    def _apply_mode(self, mode: str) -> None:
+        if mode == "compact":
+            self.status_row.setVisible(False)
+            self.task_status.setVisible(False)
+            self.transcript.setVisible(False)
+            self.setMinimumSize(*self.COMPACT_SIZE)
+            self.resize(*self.COMPACT_SIZE)
+            return
+
+        self.status_row.setVisible(True)
+        self.task_status.setVisible(bool(self.task_status.text()))
+        if mode == "active" and not self._has_conversation:
+            self.transcript.setVisible(False)
+            self.setMinimumSize(*self.ACTIVE_SIZE)
+            self.resize(*self.ACTIVE_SIZE)
+        else:
+            self.transcript.setVisible(True)
+            self.setMinimumSize(*self.EXPANDED_SIZE)
+            self.resize(*self.EXPANDED_SIZE)
+
     def _submit(self) -> None:
         text = self.input.text().strip()
         if not text:
@@ -244,18 +268,22 @@ class IslandWindow(QDialog):
         self.submitted.emit(text)
 
     def append_user(self, text: str) -> None:
+        self._has_conversation = True
+        self._apply_mode("expanded")
         self.transcript.append(
-            '<div style="margin:8px 0 4px 44px; color:#bfc6d8;">'
-            '<span style="color:#7f8492; font-size:10px;">YOU</span><br>'
+            '<div style="margin:7px 0 5px 52px; color:#bfc6d8;">'
+            '<span style="color:#6f7480; font-size:9px;">YOU</span><br>'
             f'{self._escape(text)}</div>'
         )
         self._scroll_to_bottom()
 
     def append_operator(self, text: str) -> None:
+        self._has_conversation = True
+        self._apply_mode("expanded")
         body = self._escape(text).replace(chr(10), "<br>")
         self.transcript.append(
-            '<div style="margin:8px 38px 8px 0; color:#f1f1f4;">'
-            '<span style="color:#8e93a2; font-size:10px;">OPERATOR</span><br>'
+            '<div style="margin:7px 44px 7px 0; color:#f1f1f4;">'
+            '<span style="color:#777c88; font-size:9px;">OPERATOR</span><br>'
             f'{body}</div>'
         )
         self._scroll_to_bottom()
@@ -269,27 +297,36 @@ class IslandWindow(QDialog):
         return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def set_state(self, state: AgentState) -> None:
+        self._state = state
         p = presentation_for(state)
-        label = p.label
-        color = "#c9cbd3"
+        self.status.setText(p.label.casefold())
+
+        color = "#858995"
         if state == AgentState.DONE:
-            color = "#9fe0ae"
+            color = "#91cda0"
         elif state == AgentState.ERROR:
-            color = "#ef9a9a"
+            color = "#dc8f8f"
         elif state == AgentState.NEEDS_APPROVAL:
-            color = "#f0cd73"
+            color = "#d9b96d"
         elif state in {AgentState.THINKING, AgentState.WORKING, AgentState.LISTENING}:
-            color = "#b9c8f5"
-        self.status.setText(f"● {label}")
-        self.status.setStyleSheet(
-            f"color:{color}; background:#202127; border:1px solid #34363d; "
-            "border-radius:11px; padding:4px 9px; font-size:11px;"
+            color = "#aebde8"
+        self.status_dot.setStyleSheet(
+            f"color:{color}; background:transparent; border:none; font-size:8px;"
         )
-        busy = state in {AgentState.THINKING, AgentState.WORKING, AgentState.NEEDS_APPROVAL}
+
+        busy = state in _BUSY_STATES
         self.send.setEnabled(not busy)
         self.input.setEnabled(not busy)
         self.stop.setEnabled(busy)
         self.stop.setVisible(busy)
+
+        if state == AgentState.IDLE and not self._has_conversation:
+            self._apply_mode("compact")
+        elif self._has_conversation:
+            self._apply_mode("expanded")
+        else:
+            self._apply_mode("active")
+
         if state == AgentState.WAITING_FOR_INPUT:
             self.input.setEnabled(True)
             self.send.setEnabled(True)
@@ -297,13 +334,14 @@ class IslandWindow(QDialog):
 
     def set_task(self, task: dict[str, Any] | None) -> None:
         if not task:
-            self.task_status.setText("Ask me to do something on this computer.")
-            self.stop.setEnabled(False)
-            self.stop.setVisible(False)
+            self.task_status.clear()
+            if self._state == AgentState.IDLE and not self._has_conversation:
+                self._apply_mode("compact")
             return
+
         goal = " ".join(str(task.get("goal", "")).split())
-        if len(goal) > 118:
-            goal = goal[:115] + "…"
+        if len(goal) > 104:
+            goal = goal[:101] + "…"
         raw_status = str(task.get("status", "unknown"))
         status = raw_status.replace("_", " ")
         pending = task.get("pending_field")
@@ -326,9 +364,13 @@ class IslandWindow(QDialog):
         detail = f"{status}{suffix}"
         if context_bits:
             detail += "  ·  " + " · ".join(context_bits)
-        self.task_status.setText(f"{goal}<br><span style='color:#777b86; font-size:10px;'>{detail}</span>")
+        self.task_status.setText(
+            f"{self._escape(goal)}<br><span style='color:#6f737e; font-size:9px;'>{self._escape(detail)}</span>"
+        )
         self.task_status.setTextFormat(Qt.TextFormat.RichText)
+        self.task_status.setVisible(True)
 
         active = raw_status in _ACTIVE_TASK_STATES
         self.stop.setEnabled(active)
         self.stop.setVisible(active)
+        self._apply_mode("expanded" if self._has_conversation else "active")
