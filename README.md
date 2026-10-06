@@ -1,4 +1,4 @@
-# UNNAMED Operator
+# Operator
 
 **A local-first AI desktop agent for safe, privacy-conscious computer automation.**
 
@@ -227,8 +227,6 @@ CI is supplemented by real-device field testing because GUI, permissions, platfo
 
 ## Research direction
 
-Operator is also **R-004** within the UNNAMED independent AI research and engineering lab.
-
 The project is investigating whether a small local model paired with a deterministic control plane can approach the reliability of larger agents on common desktop workflows while using substantially fewer resources and keeping sensitive execution local.
 
 Measurements planned/under collection include:
@@ -279,7 +277,3 @@ Features in this roadmap are plans, not claims about the current build.
 Operator is being developed in public as an experimental system, not presented as finished software. Issues, architecture changes, and failed experiments are expected during the alpha phase.
 
 For version history, see [CHANGELOG.md](CHANGELOG.md).
-
----
-
-**UNNAMED — Independent AI Research & Engineering Lab**
