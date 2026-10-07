@@ -8,7 +8,7 @@ class SecurityError(PermissionError):
     pass
 
 
-READ_TOOLS = {"list_files", "search_files", "search_text", "largest_files", "read_text", "file_info"}
+READ_TOOLS = {"list_files", "search_files", "search_text", "largest_files", "read_text", "file_info", "web_search", "web_open"}
 WRITE_TOOLS = {"create_folder", "move_files", "copy_files", "rename_file"}
 ALLOWED_TOOLS = READ_TOOLS | WRITE_TOOLS
 
@@ -41,7 +41,6 @@ def _resolve_user_folder_alias(value: str) -> Path | None:
                 suffix = slashy[len(prefix):].lstrip("/")
                 return home / folder_name / Path(suffix)
 
-    # Small local models sometimes invent a Unix home path even on Windows.
     match = re.match(
         r"^/(?:home|users)/[^/]+/(downloads|desktop|documents)(?:/(.*))?$",
         slashy,
@@ -55,13 +54,7 @@ def _resolve_user_folder_alias(value: str) -> Path | None:
     return None
 
 
-
 def _resolve_alias_against_roots(value: str, roots: tuple[Path, ...]) -> Path | None:
-    """Prefer a configured sandbox root for Desktop/Downloads/Documents aliases.
-
-    This keeps aliases portable in tests and in custom user configurations while
-    still falling back to the current OS home-folder convention when needed.
-    """
     raw = value.strip().strip('"').strip("'").replace("\\", "/")
     folded = raw.casefold().rstrip("/")
     for key, folder_name in _SPECIAL_FOLDERS.items():
@@ -74,13 +67,8 @@ def _resolve_alias_against_roots(value: str, roots: tuple[Path, ...]) -> Path | 
                     return (matching[0] / Path(suffix)).resolve(strict=False) if suffix else matching[0]
     return None
 
-def normalize_path(value: str | Path) -> Path:
-    """Normalize absolute paths and known aliases.
 
-    Relative paths are intentionally *not* anchored here because choosing the
-    correct allowed root requires access to the configured sandbox roots. Use
-    resolve_allowed_path()/assert_allowed() for execution.
-    """
+def normalize_path(value: str | Path) -> Path:
     if isinstance(value, str):
         aliased = _resolve_user_folder_alias(value)
         if aliased is not None:
@@ -97,12 +85,10 @@ def is_within(path: Path, root: Path) -> bool:
 
 
 def _existing_prefix_depth(candidate: Path, root: Path) -> int:
-    """Return how many relative path segments are backed by existing paths."""
     try:
         rel = candidate.relative_to(root)
     except ValueError:
         return -1
-
     parts = rel.parts
     for depth in range(len(parts), 0, -1):
         prefix = root.joinpath(*parts[:depth])
@@ -112,13 +98,6 @@ def _existing_prefix_depth(candidate: Path, root: Path) -> int:
 
 
 def resolve_allowed_path(path_value: str | Path, allowed_roots: tuple[Path, ...]) -> Path:
-    """Resolve a user/model path against sandbox roots without guessing silently.
-
-    For relative paths such as ``OperatorTest/PDFs`` we prefer the allowed root
-    whose existing path prefix is the strongest match. This lets a follow-up
-    request refer to a folder created on Desktop by name, while still rejecting
-    ambiguous references that exist in multiple allowed roots.
-    """
     roots = tuple(Path(root).expanduser().resolve(strict=False) for root in allowed_roots)
     if not roots:
         raise SecurityError("No allowed roots are configured.")
@@ -143,8 +122,6 @@ def resolve_allowed_path(path_value: str | Path, allowed_roots: tuple[Path, ...]
         printable = ", ".join(str(root) for root in roots)
         raise SecurityError(f"Path is outside allowed roots: {candidate}. Allowed roots: {printable}")
 
-    # Relative path: score each sandbox root by how much of the requested path
-    # already exists. A unique strongest match is safe and deterministic.
     scored: list[tuple[int, Path]] = []
     for root in roots:
         candidate = (root / raw).resolve(strict=False)
@@ -152,18 +129,11 @@ def resolve_allowed_path(path_value: str | Path, allowed_roots: tuple[Path, ...]
 
     best_depth = max(depth for depth, _ in scored)
     best = [candidate for depth, candidate in scored if depth == best_depth]
-
-    # Require at least one path segment beyond the sandbox root to already exist
-    # when there are multiple roots. Otherwise a bare relative destination such
-    # as "NewFolder" is ambiguous and must be grounded by the planner/user.
     if best_depth > 0 and len(best) == 1:
         return best[0]
-
     if len(roots) == 1:
         return best[0]
 
-    # As a final deterministic case, allow the current working directory when it
-    # is itself one of the configured roots and no competing root matched.
     cwd = Path.cwd().resolve(strict=False)
     cwd_matches = [root for root in roots if root == cwd]
     if best_depth == 0 and len(cwd_matches) == 1:

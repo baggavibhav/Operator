@@ -5,6 +5,7 @@ import json
 import platform
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ Available tools and arguments:
 - move_files(sources, destination_dir, overwrite=false)
 - copy_files(sources, destination_dir, overwrite=false)
 - rename_file(path, new_name, overwrite=false)
+- web_search(query, limit=5)
+- web_open(url, max_chars=null)
 
 A later step may reference an earlier result using strings like:
 $steps.0.paths
@@ -33,7 +36,7 @@ Rules:
 1. Only use the listed tools.
 2. Never invent a path the task does not imply except a child folder/file name needed to satisfy the goal.
 3. Prefer read-only discovery before writes when target files are not explicit.
-4. There is NO delete, shell, browser, email, purchasing, or generic desktop-control tool in V0.3.
+4. Web access is read-only in V0.4: web_search and web_open may retrieve public http/https content. There is still NO delete, arbitrary shell, authenticated web action, purchasing, email sending, or generic desktop control.
 5. Keep plans short and dependency ordered.
 6. For moving/copying files found by a search, sources MUST reference $steps.N.paths. Never use wildcards.
 7. Search the source folder before creating/using a destination and moving the results.
@@ -53,6 +56,8 @@ _TOOL_ARG_SPEC: dict[str, dict[str, set[str]]] = {
     "move_files": {"required": {"sources", "destination_dir"}, "optional": {"overwrite"}},
     "copy_files": {"required": {"sources", "destination_dir"}, "optional": {"overwrite"}},
     "rename_file": {"required": {"path", "new_name"}, "optional": {"overwrite"}},
+    "web_search": {"required": {"query"}, "optional": {"limit"}},
+    "web_open": {"required": {"url"}, "optional": {"max_chars"}},
 }
 
 _PATH_FIELDS: dict[str, tuple[str, ...]] = {
@@ -78,9 +83,9 @@ class PlannerError(RuntimeError):
 
 def build_system_prompt(settings: Settings) -> str:
     roots = "\n".join(f"- {root}" for root in settings.allowed_roots)
-    return f"""You are the planning component inside UNNAMED Local Operator V0.3.
+    return f"""You are the planning component inside UNNAMED Local Operator V0.4.
 The orchestrator owns task state, clarifications, execution, approvals, recovery, and completion.
-Your job is narrower: propose a safe minimal filesystem plan for the current task state.
+Your job is narrower: propose a safe minimal plan for the current task state.
 
 Runtime environment:
 - Operating system: {platform.system()}
@@ -223,6 +228,32 @@ def validate_plan(plan: dict[str, Any], settings: Settings) -> dict[str, Any]:
             else:
                 raise PlannerError(f"Step {idx} sources must be a path list or $steps.N.paths reference.")
 
+        if tool == "web_search":
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                raise PlannerError(f"Step {idx} web_search query must be a non-empty string.")
+            if query.startswith("$steps."):
+                raise PlannerError("web_search cannot send prior tool output to a search provider.")
+
+        if tool == "web_open":
+            url = args.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise PlannerError(f"Step {idx} web_open url must be a non-empty string.")
+            if url.startswith("$steps."):
+                match = re.fullmatch(r"\$steps\.(\d+)\.(?:results|links)\.\d+\.url", url)
+                if not match:
+                    raise PlannerError("web_open may only follow a URL returned by a prior web_search/web_open step.")
+                source_idx = int(match.group(1))
+                if source_idx >= idx:
+                    raise PlannerError(f"Step {idx} references a future/unavailable web step {source_idx}.")
+                source_tool = clean_steps[source_idx]["tool"] if source_idx < len(clean_steps) else None
+                if source_tool not in {"web_search", "web_open"}:
+                    raise PlannerError("web_open cannot send filesystem/tool data to the network.")
+            else:
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    raise PlannerError("web_open requires a public http/https URL or a prior web result URL reference.")
+
         clean_steps.append({"tool": tool, "args": copy.deepcopy(args), "reason": reason})
 
     return {"summary": summary.strip(), "clarification": None, "steps": clean_steps}
@@ -235,24 +266,18 @@ def _ground_static_path(value: Any, settings: Settings) -> Any:
 
 
 def bind_known_context(plan: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-    """Bind durable orchestrator state into underspecified candidate tool calls.
-
-    This is not conversational prompt repair: the orchestrator has already
-    resolved these fields. The planner is not allowed to drop them while
-    translating the task into tool arguments.
-    """
     if not isinstance(plan, dict):
         return plan
     known = context.get("known") if isinstance(context.get("known"), dict) else {}
     source = known.get("source_folder")
     destination = known.get("destination_folder")
     file_extension = known.get("file_extension")
+    explicit_sources = known.get("explicit_sources")
     bound = copy.deepcopy(plan)
     steps = bound.get("steps")
     if not isinstance(steps, list):
         return bound
 
-    # Determine which discovery steps actually feed a move/copy action.
     referenced: set[int] = set()
     for step in steps:
         if not isinstance(step, dict) or step.get("tool") not in {"move_files", "copy_files"}:
@@ -271,11 +296,6 @@ def bind_known_context(plan: dict[str, Any], context: dict[str, Any]) -> dict[st
             args = {}
             step["args"] = args
         tool = step.get("tool")
-        # Durable orchestrator state is authoritative. The planning model may
-        # propose an incomplete *or conflicting* path (for example Desktop/PDFs
-        # instead of Desktop/OperatorTest/PDFs). Once the orchestrator has
-        # resolved a semantic slot, the compiler must overwrite the model's
-        # corresponding tool argument rather than merely filling blanks.
         if source and idx in referenced and tool in {"search_files", "list_files", "largest_files"}:
             args["path"] = source
         if file_extension and idx in referenced and tool == "search_files":
@@ -284,6 +304,8 @@ def bind_known_context(plan: dict[str, Any], context: dict[str, Any]) -> dict[st
             args["path"] = destination
         if destination and tool in {"move_files", "copy_files"}:
             args["destination_dir"] = destination
+        if explicit_sources and tool in {"move_files", "copy_files"}:
+            args["sources"] = list(explicit_sources) if isinstance(explicit_sources, list) else explicit_sources
     return bound
 
 
@@ -354,13 +376,6 @@ def _call_ollama(messages: list[dict[str, str]], settings: Settings) -> str:
 
 
 def propose_with_ollama(user_request: str, settings: Settings) -> dict[str, Any]:
-    """Return the model candidate without assigning it control-plane semantics.
-
-    The desktop orchestrator consumes this raw candidate and decides whether a
-    clarification is still needed, whether stale clarification metadata can be
-    discarded, and whether the executable portion is safe to compile. This
-    keeps task lifecycle decisions out of the model backend.
-    """
     system = build_system_prompt(settings)
     messages = [
         {"role": "system", "content": system},
@@ -376,7 +391,6 @@ def plan_with_ollama(user_request: str, settings: Settings) -> dict[str, Any]:
         {"role": "system", "content": system},
         {"role": "user", "content": user_request},
     ]
-
     first_raw = bind_known_context(_extract_json(_call_ollama(messages, settings)), context)
     try:
         return prepare_plan(first_raw, settings)

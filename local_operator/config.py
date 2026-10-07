@@ -11,7 +11,8 @@ CONFIG_PATH = APP_DIR / "config.json"
 AUDIT_DB_PATH = APP_DIR / "audit.db"
 TASK_DB_PATH = APP_DIR / "tasks.db"
 
-DEFAULT_MODEL = os.getenv("OPERATOR_MODEL", "qwen2.5:1.5b")
+DEFAULT_MODEL = os.getenv("OPERATOR_MODEL", "phi4-mini")
+LEGACY_DEFAULT_MODEL = "qwen2.5:1.5b"
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 
 
@@ -42,6 +43,7 @@ class Settings:
     allowed_roots: tuple[Path, ...]
     max_read_chars: int = 12000
     max_steps: int = 10
+    web_enabled: bool = True
 
 
 def ensure_config() -> None:
@@ -54,6 +56,7 @@ def ensure_config() -> None:
         "allowed_roots": _default_roots(),
         "max_read_chars": 12000,
         "max_steps": 10,
+        "web_enabled": True,
     }
     CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -67,9 +70,29 @@ def _clean_roots(values: Iterable[str]) -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def _migrate_legacy_development_default(data: dict) -> dict:
+    """Move only the old stock development default; preserve custom choices."""
+    if os.getenv("OPERATOR_MODEL"):
+        return data
+    if data.get("model") != LEGACY_DEFAULT_MODEL:
+        return data
+    migrated = dict(data)
+    migrated["model"] = DEFAULT_MODEL
+    try:
+        CONFIG_PATH.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+    except OSError:
+        # Settings can still use the new default for this process if the file is
+        # temporarily read-only; do not make startup depend on config mutation.
+        pass
+    return migrated
+
+
 def load_settings(model_override: str | None = None) -> Settings:
     ensure_config()
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("Operator config must contain a JSON object.")
+    data = _migrate_legacy_development_default(data)
 
     env_roots = os.getenv("OPERATOR_ALLOWED_ROOTS")
     roots_raw = env_roots.split(os.pathsep) if env_roots else data.get("allowed_roots", _default_roots())
@@ -83,4 +106,5 @@ def load_settings(model_override: str | None = None) -> Settings:
         allowed_roots=roots,
         max_read_chars=int(data.get("max_read_chars", 12000)),
         max_steps=int(data.get("max_steps", 10)),
+        web_enabled=bool(data.get("web_enabled", True)),
     )

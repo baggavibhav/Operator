@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "UNNAMED Operator V0.3.2 bootstrap"
+echo "UNNAMED Operator V0.5 bootstrap"
 echo "Development build: installs runtime dependencies into a local .venv only."
 
 command -v python3 >/dev/null 2>&1 || { echo "Python 3.11+ is required for this development build. The final installer will bundle its runtime."; exit 1; }
@@ -30,14 +30,15 @@ else
 fi
 
 if command -v ollama >/dev/null 2>&1; then
-  if ! ollama list 2>/dev/null | grep -q '^qwen2\.5:1\.5b[[:space:]]'; then
-    echo "Pulling local development model..."
-    ollama pull qwen2.5:1.5b
+  if ! ollama list 2>/dev/null | grep -Eq '^phi4-mini(:latest)?[[:space:]]'; then
+    echo "Pulling Phi-4 Mini local development model..."
+    ollama pull phi4-mini
   else
-    echo "Local development model already installed."
+    echo "Phi-4 Mini development model already installed."
   fi
 else
-  echo "Warning: Ollama was not found. Install/start Ollama for V0.3.2 model inference."
+  echo "Warning: Ollama was not found. Model-planned and research-agent tasks need Ollama; deterministic local file tasks can still run."
 fi
 
+echo "Starting UNNAMED Operator V0.5..."
 "$PYTHON" desktop_main.py

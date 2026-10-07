@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from operator_desktop.app import main
+from operator_desktop.v05_app import main
 
 
 if __name__ == "__main__":
