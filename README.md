@@ -1,5 +1,7 @@
 # Operator
 
+[![CI](https://github.com/baggavibhav/Operator/actions/workflows/YOUR_WORKFLOW_FILE.yml/badge.svg)](https://github.com/baggavibhav/Operator/actions)
+
 **A local-first AI desktop agent for safe, privacy-conscious computer automation.**
 
 > **Alpha / active R&D.** Operator is an experimental project under active development. Capabilities, interfaces, installation steps, and security boundaries may change. It is not yet intended for production use.
